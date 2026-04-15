@@ -12,6 +12,7 @@ __pycache__/
 # Tesla credentials, tokens and scripts
 tesla/
 cache.json
+.octopus_defaults.json
 
 # Downloaded data and cached tariffs
 download/

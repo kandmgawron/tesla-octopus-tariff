@@ -21,6 +21,42 @@ except ImportError:
 LOCAL_TZ = ZoneInfo("Europe/London")
 DEFAULT_TARIFF_INDEX = "https://files.energy-stats.uk/csv_output/"
 
+DEFAULTS_FILE = Path(".octopus_defaults.json")
+
+# Keys that can be saved as user defaults
+SAVEABLE_DEFAULTS = {
+    "region_code", "battery_capacity_kwh", "extra_daily_kwh",
+    "extra_start", "extra_end", "email", "out_dir", "cache_dir",
+    "intelligent_offpeak_import", "intelligent_peak_import",
+    "intelligent_export", "intelligent_standing_charge",
+    "intelligent_offpeak_start", "intelligent_offpeak_end",
+    "agile_standing_charge", "agile_flex_hours", "agile_flex_max_kw",
+    "ev_exclusion_enabled", "ev_min_power_w", "ev_start", "ev_end",
+}
+
+
+def load_defaults() -> dict:
+    """Load saved defaults from .octopus_defaults.json if it exists."""
+    if DEFAULTS_FILE.exists():
+        with open(DEFAULTS_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_defaults(defaults: dict) -> None:
+    """Save defaults to .octopus_defaults.json."""
+    with open(DEFAULTS_FILE, "w") as f:
+        json.dump(defaults, f, indent=2)
+
+
+def apply_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    """Apply saved defaults to any argument that wasn't explicitly set on the command line."""
+    saved = load_defaults()
+    for key, value in saved.items():
+        if key in SAVEABLE_DEFAULTS and getattr(args, key, None) is None:
+            setattr(args, key, value)
+    return args
+
 REGION_CODE_TO_NAME = {
     "A": "Eastern_England",
     "B": "East_Midlands",
@@ -449,70 +485,255 @@ def run_compare(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    saved = load_defaults()
+
+    def d(key, fallback):
+        """Return saved default if available, otherwise the hardcoded fallback."""
+        return saved.get(key, fallback)
+
     parser = argparse.ArgumentParser(
-        description="Compare Tesla Powerwall usage against Octopus tariffs with sane defaults.",
-        epilog="Use --download-data to automatically download Powerwall data using teslapy. "
-               "This will prompt for Tesla login and save power data to download/ directory.",
+        description="Compare Tesla Powerwall usage against Octopus Intelligent and Agile tariffs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  # Save your settings once
+  %(prog)s set-defaults --region-code M --battery-capacity-kwh 13 --email you@example.com
+
+  # Download a year of Powerwall data (uses saved email)
+  %(prog)s download-data
+
+  # Run comparison with saved defaults
+  %(prog)s default --power-csv download/1689188759506284/power.csv
+
+  # Override a saved default for one run
+  %(prog)s default --power-csv power.csv --region-code C
+""",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    default = sub.add_parser("default", help="Simplest first run")
-    default.add_argument("--power-csv", required=True, help="Tesla power_all.csv style file")
-    default.add_argument("--out-dir", default="output")
-    default.add_argument("--cache-dir", default=".cache/tariffs")
-    default.add_argument("--region-code", default="M")
-    default.add_argument("--extra-daily-kwh", type=float, default=0.0)
-    default.add_argument("--battery-capacity-kwh", type=float, default=13.0)
-    default.add_argument("--start-date")
-    default.add_argument("--end-date")
-    default.add_argument("--refresh-tariffs", action="store_true")
-    default.add_argument("--no-ev-exclusion", action="store_true")
+    # ── set-defaults ──────────────────────────────────────────────
+    sd = sub.add_parser("set-defaults",
+        help="Save default settings so you don't have to type them every time",
+        description="Save default values to .octopus_defaults.json. "
+                    "These are used automatically unless overridden on the command line.")
+    sd.add_argument("--region-code", help="Octopus region code (run list-regions to see options)")
+    sd.add_argument("--battery-capacity-kwh", type=float, help="Powerwall usable capacity in kWh (e.g. 13.0 for a single PW2)")
+    sd.add_argument("--extra-daily-kwh", type=float, help="Extra daily consumption to model, in kWh (e.g. heat pump)")
+    sd.add_argument("--extra-start", help="Start of extra consumption window (HH:MM)")
+    sd.add_argument("--extra-end", help="End of extra consumption window (HH:MM)")
+    sd.add_argument("--email", help="Tesla account email for download-data")
+    sd.add_argument("--out-dir", help="Directory for comparison output CSVs")
+    sd.add_argument("--cache-dir", help="Directory for cached Agile tariff CSVs")
+    sd.add_argument("--intelligent-offpeak-import", type=float, help="Intelligent off-peak import rate (p/kWh)")
+    sd.add_argument("--intelligent-peak-import", type=float, help="Intelligent peak import rate (p/kWh)")
+    sd.add_argument("--intelligent-export", type=float, help="Intelligent export rate (p/kWh)")
+    sd.add_argument("--intelligent-standing-charge", type=float, help="Intelligent daily standing charge (p/day)")
+    sd.add_argument("--intelligent-offpeak-start", help="Intelligent off-peak window start (HH:MM)")
+    sd.add_argument("--intelligent-offpeak-end", help="Intelligent off-peak window end (HH:MM)")
+    sd.add_argument("--agile-standing-charge", type=float, help="Agile daily standing charge (p/day)")
+    sd.add_argument("--agile-flex-hours", type=float, help="Agile flexible charging hours per day")
+    sd.add_argument("--agile-flex-max-kw", type=float, help="Agile max flexible charge rate (kW)")
+    sd.add_argument("--show", action="store_true", help="Show current saved defaults and exit")
+
+    # ── default ───────────────────────────────────────────────────
+    default = sub.add_parser("default",
+        help="Quick comparison using sensible defaults",
+        description="Run a tariff comparison with minimal configuration. "
+                    "Uses saved defaults from set-defaults where available.")
+    default.add_argument("--power-csv", required=True,
+        help="Path to Powerwall power CSV (5-min intervals with timestamp and grid_power columns)")
+    default.add_argument("--out-dir", default=d("out_dir", "output"),
+        help="Directory for output CSVs (default: %(default)s)")
+    default.add_argument("--cache-dir", default=d("cache_dir", ".cache/tariffs"),
+        help="Directory for cached Agile tariff CSVs (default: %(default)s)")
+    default.add_argument("--region-code", default=d("region_code", "M"),
+        help="Octopus region code, e.g. M=Yorkshire, C=London (default: %(default)s)")
+    default.add_argument("--extra-daily-kwh", type=float, default=d("extra_daily_kwh", 0.0),
+        help="Extra daily kWh to model, e.g. for a heat pump (default: %(default)s)")
+    default.add_argument("--battery-capacity-kwh", type=float, default=d("battery_capacity_kwh", 13.0),
+        help="Powerwall usable capacity in kWh (default: %(default)s)")
+    default.add_argument("--start-date",
+        help="Only include data from this date onwards (YYYY-MM-DD)")
+    default.add_argument("--end-date",
+        help="Only include data up to this date (YYYY-MM-DD)")
+    default.add_argument("--refresh-tariffs", action="store_true",
+        help="Re-download Agile tariff CSVs even if cached")
+    default.add_argument("--no-ev-exclusion", action="store_true",
+        help="Disable automatic EV charging detection and exclusion")
     default.set_defaults(
-        intelligent_offpeak_import=7.0,
-        intelligent_peak_import=26.0,
-        intelligent_export=15.0,
-        intelligent_standing_charge=57.01,
-        intelligent_offpeak_start="23:30",
-        intelligent_offpeak_end="05:30",
-        agile_standing_charge=66.26,
-        agile_flex_hours=6.0,
-        agile_flex_max_kw=3.3,
-        extra_start="17:00",
-        extra_end="22:00",
+        intelligent_offpeak_import=d("intelligent_offpeak_import", 7.0),
+        intelligent_peak_import=d("intelligent_peak_import", 26.0),
+        intelligent_export=d("intelligent_export", 15.0),
+        intelligent_standing_charge=d("intelligent_standing_charge", 57.01),
+        intelligent_offpeak_start=d("intelligent_offpeak_start", "23:30"),
+        intelligent_offpeak_end=d("intelligent_offpeak_end", "05:30"),
+        agile_standing_charge=d("agile_standing_charge", 66.26),
+        agile_flex_hours=d("agile_flex_hours", 6.0),
+        agile_flex_max_kw=d("agile_flex_max_kw", 3.3),
+        extra_start=d("extra_start", "17:00"),
+        extra_end=d("extra_end", "22:00"),
     )
 
-    compare = sub.add_parser("compare", help="Advanced mode with more overrides")
-    compare.add_argument("--power-csv", required=True)
-    compare.add_argument("--out-dir", default="output")
-    compare.add_argument("--cache-dir", default=".cache/tariffs")
-    compare.add_argument("--region-code", default="M")
-    compare.add_argument("--start-date")
-    compare.add_argument("--end-date")
-    compare.add_argument("--refresh-tariffs", action="store_true")
-    compare.add_argument("--battery-capacity-kwh", type=float, default=13.0)
-    compare.add_argument("--extra-daily-kwh", type=float, default=0.0)
-    compare.add_argument("--extra-start", default="17:00")
-    compare.add_argument("--extra-end", default="22:00")
-    compare.add_argument("--intelligent-offpeak-import", type=float, default=7.0)
-    compare.add_argument("--intelligent-peak-import", type=float, default=26.0)
-    compare.add_argument("--intelligent-export", type=float, default=15.0)
-    compare.add_argument("--intelligent-standing-charge", type=float, default=57.01)
-    compare.add_argument("--intelligent-offpeak-start", default="23:30")
-    compare.add_argument("--intelligent-offpeak-end", default="05:30")
-    compare.add_argument("--agile-standing-charge", type=float, default=66.26)
-    compare.add_argument("--agile-flex-hours", type=float, default=6.0)
-    compare.add_argument("--agile-flex-max-kw", type=float, default=3.3)
-    compare.add_argument("--no-ev-exclusion", action="store_true")
+    # ── compare ───────────────────────────────────────────────────
+    compare = sub.add_parser("compare",
+        help="Full comparison with all tariff parameters exposed",
+        description="Run a tariff comparison with full control over every rate and window.")
+    compare.add_argument("--power-csv", required=True,
+        help="Path to Powerwall power CSV (5-min intervals with timestamp and grid_power columns)")
+    compare.add_argument("--out-dir", default=d("out_dir", "output"),
+        help="Directory for output CSVs (default: %(default)s)")
+    compare.add_argument("--cache-dir", default=d("cache_dir", ".cache/tariffs"),
+        help="Directory for cached Agile tariff CSVs (default: %(default)s)")
+    compare.add_argument("--region-code", default=d("region_code", "M"),
+        help="Octopus region code (default: %(default)s)")
+    compare.add_argument("--start-date",
+        help="Only include data from this date onwards (YYYY-MM-DD)")
+    compare.add_argument("--end-date",
+        help="Only include data up to this date (YYYY-MM-DD)")
+    compare.add_argument("--refresh-tariffs", action="store_true",
+        help="Re-download Agile tariff CSVs even if cached")
+    compare.add_argument("--battery-capacity-kwh", type=float, default=d("battery_capacity_kwh", 13.0),
+        help="Powerwall usable capacity in kWh (default: %(default)s)")
+    compare.add_argument("--extra-daily-kwh", type=float, default=d("extra_daily_kwh", 0.0),
+        help="Extra daily kWh to model (default: %(default)s)")
+    compare.add_argument("--extra-start", default=d("extra_start", "17:00"),
+        help="Start of extra consumption window HH:MM (default: %(default)s)")
+    compare.add_argument("--extra-end", default=d("extra_end", "22:00"),
+        help="End of extra consumption window HH:MM (default: %(default)s)")
+    compare.add_argument("--intelligent-offpeak-import", type=float, default=d("intelligent_offpeak_import", 7.0),
+        help="Intelligent off-peak import rate in p/kWh (default: %(default)s)")
+    compare.add_argument("--intelligent-peak-import", type=float, default=d("intelligent_peak_import", 26.0),
+        help="Intelligent peak import rate in p/kWh (default: %(default)s)")
+    compare.add_argument("--intelligent-export", type=float, default=d("intelligent_export", 15.0),
+        help="Intelligent export rate in p/kWh (default: %(default)s)")
+    compare.add_argument("--intelligent-standing-charge", type=float, default=d("intelligent_standing_charge", 57.01),
+        help="Intelligent daily standing charge in p/day (default: %(default)s)")
+    compare.add_argument("--intelligent-offpeak-start", default=d("intelligent_offpeak_start", "23:30"),
+        help="Intelligent off-peak window start HH:MM (default: %(default)s)")
+    compare.add_argument("--intelligent-offpeak-end", default=d("intelligent_offpeak_end", "05:30"),
+        help="Intelligent off-peak window end HH:MM (default: %(default)s)")
+    compare.add_argument("--agile-standing-charge", type=float, default=d("agile_standing_charge", 66.26),
+        help="Agile daily standing charge in p/day (default: %(default)s)")
+    compare.add_argument("--agile-flex-hours", type=float, default=d("agile_flex_hours", 6.0),
+        help="Hours per day of flexible Agile charging (default: %(default)s)")
+    compare.add_argument("--agile-flex-max-kw", type=float, default=d("agile_flex_max_kw", 3.3),
+        help="Max charge rate during flexible Agile slots in kW (default: %(default)s)")
+    compare.add_argument("--no-ev-exclusion", action="store_true",
+        help="Disable automatic EV charging detection and exclusion")
 
-    download = sub.add_parser("download-data", help="Download Powerwall data using teslapy")
-    download.add_argument("--email", required=True, help="Tesla account email address")
+    # ── download-data ─────────────────────────────────────────────
+    download = sub.add_parser("download-data",
+        help="Download a year of 5-minute Powerwall data from Tesla",
+        description="Logs in to Tesla, downloads power data day-by-day in 5-minute intervals, "
+                    "merges into a single CSV, and cleans up per-day files.")
+    download.add_argument("--email", default=d("email", None),
+        help="Tesla account email address" + (f" (default: {d('email', None)})" if d("email", None) else ""))
 
-    regions = sub.add_parser("list-regions", help="Show supported region codes")
-    regions.add_argument("--json", action="store_true")
+    # ── list-regions ──────────────────────────────────────────────
+    regions = sub.add_parser("list-regions",
+        help="Show supported Octopus region codes and names")
+    regions.add_argument("--json", action="store_true",
+        help="Output as JSON instead of plain text")
 
-    refresh = sub.add_parser("refresh-tariffs", help="Download the latest region tariff CSVs into cache")
-    refresh.add_argument("--region-code", default="M")
-    refresh.add_argument("--cache-dir", default=".cache/tariffs")
+    # ── refresh-tariffs ───────────────────────────────────────────
+    refresh = sub.add_parser("refresh-tariffs",
+        help="Re-download Agile tariff CSVs into cache",
+        description="Force re-download of Agile import and export tariff CSVs for a region.")
+    refresh.add_argument("--region-code", default=d("region_code", "M"),
+        help="Octopus region code (default: %(default)s)")
+    refresh.add_argument("--cache-dir", default=d("cache_dir", ".cache/tariffs"),
+        help="Directory for cached tariff CSVs (default: %(default)s)")
+
+    # ── full-refresh ──────────────────────────────────────────────
+    full = sub.add_parser("full-refresh",
+        help="Download latest Powerwall data, refresh tariffs, and run comparison in one go",
+        description="All-in-one: downloads latest Powerwall data from Tesla, "
+                    "refreshes Agile tariff CSVs, and runs the tariff comparison.")
+    full.add_argument("--email", default=d("email", None),
+        help="Tesla account email address")
+    full.add_argument("--out-dir", default=d("out_dir", "output"),
+        help="Directory for output CSVs (default: %(default)s)")
+    full.add_argument("--cache-dir", default=d("cache_dir", ".cache/tariffs"),
+        help="Directory for cached Agile tariff CSVs (default: %(default)s)")
+    full.add_argument("--region-code", default=d("region_code", "M"),
+        help="Octopus region code (default: %(default)s)")
+    full.add_argument("--battery-capacity-kwh", type=float, default=d("battery_capacity_kwh", 13.0),
+        help="Powerwall usable capacity in kWh (default: %(default)s)")
+    full.add_argument("--no-ev-exclusion", action="store_true",
+        help="Disable automatic EV charging detection and exclusion")
+    full.set_defaults(
+        extra_daily_kwh=d("extra_daily_kwh", 0.0),
+        extra_start=d("extra_start", "17:00"),
+        extra_end=d("extra_end", "22:00"),
+        intelligent_offpeak_import=d("intelligent_offpeak_import", 7.0),
+        intelligent_peak_import=d("intelligent_peak_import", 26.0),
+        intelligent_export=d("intelligent_export", 15.0),
+        intelligent_standing_charge=d("intelligent_standing_charge", 57.01),
+        intelligent_offpeak_start=d("intelligent_offpeak_start", "23:30"),
+        intelligent_offpeak_end=d("intelligent_offpeak_end", "05:30"),
+        agile_standing_charge=d("agile_standing_charge", 66.26),
+        agile_flex_hours=d("agile_flex_hours", 6.0),
+        agile_flex_max_kw=d("agile_flex_max_kw", 3.3),
+        start_date=None, end_date=None, refresh_tariffs=True,
+    )
+
+    # ── model ─────────────────────────────────────────────────────
+    model = sub.add_parser("model",
+        help="Model a scenario with changed energy usage (e.g. new EV, hot tub)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="""Model how a change in energy usage would affect your tariff costs.
+
+Takes your real Powerwall data and applies adjustments to simulate scenarios
+like buying an EV, adding a hot tub, or installing extra solar panels.
+
+Adjustments are applied as extra daily kWh consumed (positive) or reduced (negative)
+during a specified time window.""",
+        epilog="""examples:
+  # Model adding an EV that charges 7.5 kWh/day overnight
+  %(prog)s model --power-csv power.csv --label "New EV" --adjust-kwh 7.5 --window 00:30-05:30
+
+  # Model a hot tub using 5 kWh/day in the evening
+  %(prog)s model --power-csv power.csv --label "Hot tub" --adjust-kwh 5 --window 17:00-22:00
+
+  # Model reduced usage from better insulation (-3 kWh/day spread across peak)
+  %(prog)s model --power-csv power.csv --label "Insulation" --adjust-kwh -3 --window 06:00-22:00
+
+  # Stack multiple scenarios
+  %(prog)s model --power-csv power.csv \\
+      --label "EV" --adjust-kwh 7.5 --window 00:30-05:30 \\
+      --label "Hot tub" --adjust-kwh 5 --window 17:00-22:00
+""")
+    model.add_argument("--power-csv", required=True,
+        help="Path to Powerwall power CSV")
+    model.add_argument("--label", action="append", dest="labels", required=True,
+        help="Name for this scenario adjustment (repeat for multiple)")
+    model.add_argument("--adjust-kwh", action="append", dest="adjust_kwhs", type=float, required=True,
+        help="Daily kWh change: positive=more usage, negative=less (repeat for multiple)")
+    model.add_argument("--window", action="append", dest="windows", required=True,
+        help="Time window for the adjustment as HH:MM-HH:MM (repeat for multiple)")
+    model.add_argument("--out-dir", default=d("out_dir", "output"),
+        help="Directory for output CSVs (default: %(default)s)")
+    model.add_argument("--cache-dir", default=d("cache_dir", ".cache/tariffs"),
+        help="Directory for cached Agile tariff CSVs (default: %(default)s)")
+    model.add_argument("--region-code", default=d("region_code", "M"),
+        help="Octopus region code (default: %(default)s)")
+    model.add_argument("--battery-capacity-kwh", type=float, default=d("battery_capacity_kwh", 13.0),
+        help="Powerwall usable capacity in kWh (default: %(default)s)")
+    model.add_argument("--no-ev-exclusion", action="store_true",
+        help="Disable automatic EV charging detection and exclusion")
+    model.set_defaults(
+        extra_daily_kwh=0.0,
+        extra_start="17:00", extra_end="22:00",
+        intelligent_offpeak_import=d("intelligent_offpeak_import", 7.0),
+        intelligent_peak_import=d("intelligent_peak_import", 26.0),
+        intelligent_export=d("intelligent_export", 15.0),
+        intelligent_standing_charge=d("intelligent_standing_charge", 57.01),
+        intelligent_offpeak_start=d("intelligent_offpeak_start", "23:30"),
+        intelligent_offpeak_end=d("intelligent_offpeak_end", "05:30"),
+        agile_standing_charge=d("agile_standing_charge", 66.26),
+        agile_flex_hours=d("agile_flex_hours", 6.0),
+        agile_flex_max_kw=d("agile_flex_max_kw", 3.3),
+        start_date=None, end_date=None, refresh_tariffs=False,
+    )
 
     return parser
 
@@ -521,8 +742,17 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.command == "set-defaults":
+        return run_set_defaults(args)
     if args.command == "download-data":
+        if not args.email:
+            print("Error: --email is required (or save it with: set-defaults --email you@example.com)")
+            return 1
         return run_download_data(args)
+    if args.command == "full-refresh":
+        return run_full_refresh(args)
+    if args.command == "model":
+        return run_model(args)
     if args.command in {"default", "compare"}:
         return run_compare(args)
     if args.command == "list-regions":
@@ -536,6 +766,187 @@ def main(argv=None) -> int:
         in_path, out_path = download_region_tariffs(args.region_code, Path(args.cache_dir), force=True)
         print(f"Downloaded:\n- {in_path}\n- {out_path}")
         return 0
+    return 0
+
+
+def run_set_defaults(args) -> int:
+    """Save or show user defaults."""
+    if args.show:
+        saved = load_defaults()
+        if not saved:
+            print("No defaults saved yet. Use set-defaults with options to save them.")
+            print("Example: set-defaults --region-code M --battery-capacity-kwh 13 --email you@example.com")
+        else:
+            print("Saved defaults:")
+            for key, value in sorted(saved.items()):
+                print(f"  {key}: {value}")
+        return 0
+
+    # Collect any provided values
+    saved = load_defaults()
+    updated = False
+    for key in SAVEABLE_DEFAULTS:
+        val = getattr(args, key, None)
+        if val is not None:
+            saved[key] = val
+            updated = True
+
+    if not updated:
+        print("No values provided. Use --show to see current defaults, or pass options to save.")
+        print("Example: set-defaults --region-code M --battery-capacity-kwh 13 --email you@example.com")
+        return 0
+
+    save_defaults(saved)
+    print("Defaults saved to .octopus_defaults.json:")
+    for key, value in sorted(saved.items()):
+        print(f"  {key}: {value}")
+    return 0
+
+
+def run_full_refresh(args) -> int:
+    """Download latest Powerwall data, refresh tariffs, and run comparison."""
+    if not args.email:
+        print("Error: --email is required (or save it with: set-defaults --email you@example.com)")
+        return 1
+
+    # Step 1: Download Powerwall data
+    print("=" * 60)
+    print("STEP 1: Downloading Powerwall data from Tesla")
+    print("=" * 60)
+    rc = run_download_data(args)
+    if rc != 0:
+        return rc
+
+    # Find the downloaded power CSV
+    download_dir = Path("download")
+    power_csvs = list(download_dir.glob("*/power.csv"))
+    if not power_csvs:
+        print("Error: No power.csv found after download")
+        return 1
+    power_csv = power_csvs[0]
+
+    # Step 2: Refresh tariffs
+    print()
+    print("=" * 60)
+    print("STEP 2: Refreshing Agile tariff data")
+    print("=" * 60)
+    in_path, out_path = download_region_tariffs(args.region_code, Path(args.cache_dir), force=True)
+    print(f"Downloaded:\n- {in_path}\n- {out_path}")
+
+    # Step 3: Run comparison
+    print()
+    print("=" * 60)
+    print("STEP 3: Running tariff comparison")
+    print("=" * 60)
+    args.power_csv = str(power_csv)
+    return run_compare(args)
+
+
+def run_model(args) -> int:
+    """Run scenario modelling with adjusted energy usage."""
+    labels = args.labels
+    adjust_kwhs = args.adjust_kwhs
+    windows = args.windows
+
+    if not (len(labels) == len(adjust_kwhs) == len(windows)):
+        print("Error: --label, --adjust-kwh, and --window must be provided the same number of times")
+        return 1
+
+    # Validate windows
+    for w in windows:
+        if "-" not in w:
+            print(f"Error: window '{w}' must be in HH:MM-HH:MM format")
+            return 1
+        parts = w.split("-")
+        if len(parts) != 2:
+            print(f"Error: window '{w}' must be in HH:MM-HH:MM format")
+            return 1
+        for p in parts:
+            try:
+                parse_hhmm(p)
+            except ValueError:
+                print(f"Error: invalid time '{p}' in window '{w}'")
+                return 1
+
+    # Run baseline comparison first
+    print("=" * 60)
+    print("BASELINE: Current usage")
+    print("=" * 60)
+    rc = run_compare(args)
+    if rc != 0:
+        return rc
+
+    # Read baseline results
+    out_dir = Path(args.out_dir)
+    baseline_df = pd.read_csv(out_dir / "summary.csv")
+    baseline_rows = baseline_df.to_dict(orient="records")
+
+    # Run each scenario by stacking adjustments
+    total_extra_kwh = 0.0
+    scenario_descriptions = []
+
+    for i, (label, kwh, window) in enumerate(zip(labels, adjust_kwhs, windows)):
+        total_extra_kwh += kwh
+        start_hhmm, end_hhmm = window.split("-")
+        scenario_descriptions.append(f"{label}: {'+' if kwh >= 0 else ''}{kwh} kWh/day ({window})")
+
+        print()
+        print("=" * 60)
+        scenario_name = " + ".join(l for l, _ in zip(labels[:i+1], adjust_kwhs[:i+1]))
+        print(f"SCENARIO: {scenario_name}")
+        for desc in scenario_descriptions:
+            print(f"  {desc}")
+        print(f"  Total adjustment: {'+' if total_extra_kwh >= 0 else ''}{total_extra_kwh} kWh/day")
+        print("=" * 60)
+
+        # Override extra_daily_kwh and window for this scenario
+        args.extra_daily_kwh = total_extra_kwh
+        args.extra_start = start_hhmm
+        args.extra_end = end_hhmm
+
+        # Use a separate output dir for each scenario
+        scenario_dir = out_dir / f"scenario_{i+1}"
+        args.out_dir = str(scenario_dir)
+        rc = run_compare(args)
+        if rc != 0:
+            return rc
+
+    # Print combined summary
+    print()
+    print("=" * 60)
+    print("SUMMARY: All scenarios compared")
+    print("=" * 60)
+
+    all_rows = []
+    # Baseline
+    for row in baseline_rows:
+        row["scenario"] = "baseline"
+        all_rows.append(row)
+
+    # Each scenario
+    cumulative_labels = []
+    for i, label in enumerate(labels):
+        cumulative_labels.append(label)
+        scenario_dir = out_dir / f"scenario_{i+1}"
+        scenario_df = pd.read_csv(scenario_dir / "summary.csv")
+        for row in scenario_df.to_dict(orient="records"):
+            row["scenario"] = " + ".join(cumulative_labels)
+            all_rows.append(row)
+
+    headers = ["scenario", "tariff", "import_cost_gbp", "export_revenue_gbp", "standing_charge_gbp", "net_cost_gbp"]
+    widths = {h: max(len(h), max(len(str(r.get(h, ""))) for r in all_rows)) for h in headers}
+    print("  ".join(h.ljust(widths[h]) for h in headers))
+    print("  ".join("-" * widths[h] for h in headers))
+    for row in all_rows:
+        print("  ".join(str(row.get(h, "")).ljust(widths[h]) for h in headers))
+
+    # Save combined summary
+    combined_df = pd.DataFrame(all_rows)
+    write_csv(combined_df, out_dir / "model_summary.csv")
+    print(f"\nModel summary written to: {out_dir / 'model_summary.csv'}")
+
+    # Restore out_dir
+    args.out_dir = str(out_dir)
     return 0
 
 
