@@ -150,7 +150,12 @@ def read_agile_csv(path: Path, timezone: str = "Europe/London") -> pd.DataFrame:
     raw["price_p_per_kwh"] = pd.to_numeric(raw["price_p_per_kwh"], errors="coerce")
     raw = raw.dropna(subset=["timestamp", "price_p_per_kwh"]).copy()
     tz = ZoneInfo(timezone)
-    raw["slot_start"] = raw["timestamp"].dt.tz_convert(tz).dt.floor("30min")
+    # Handle DST transitions by inferring ambiguous times and shifting forward for nonexistent times
+    raw["slot_start"] = (
+        raw["timestamp"]
+        .dt.tz_convert(tz)
+        .dt.floor("30min", ambiguous="infer", nonexistent="shift_forward")
+    )
     raw = raw.drop_duplicates(subset=["slot_start"], keep="last")
     return raw[["slot_start", "price_p_per_kwh", "region_code", "region_name"]].sort_values("slot_start")
 
@@ -159,10 +164,13 @@ def load_power_csv(path: Path, scenario: ScenarioConfig) -> pd.DataFrame:
     df = pd.read_csv(path)
     if "timestamp" not in df.columns or "grid_power" not in df.columns:
         raise ValueError("Power CSV must include timestamp and grid_power columns")
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df["grid_power"] = pd.to_numeric(df["grid_power"], errors="coerce")
     df = df.dropna(subset=["timestamp", "grid_power"]).copy()
-    df["timestamp_local"] = ensure_localized(df["timestamp"], scenario.timezone)
+    tz = ZoneInfo(scenario.timezone)
+    # Floor in UTC first (no DST ambiguity), then convert to local
+    df["timestamp_local"] = df["timestamp"].dt.tz_convert(tz)
+    df["slot_start"] = df["timestamp"].dt.floor("30min").dt.tz_convert(tz)
 
     df["import_kwh_5m"] = np.where(df["grid_power"] > 0, df["grid_power"] / 12.0 / 1000.0, 0.0)
     df["export_kwh_5m"] = np.where(df["grid_power"] < 0, -df["grid_power"] / 12.0 / 1000.0, 0.0)
@@ -177,7 +185,6 @@ def load_power_csv(path: Path, scenario: ScenarioConfig) -> pd.DataFrame:
 
     df["car_import_kwh_5m"] = np.where(df["is_car_charging"], df["import_kwh_5m"], 0.0)
     df["non_car_import_kwh_5m"] = np.where(~df["is_car_charging"], df["import_kwh_5m"], 0.0)
-    df["slot_start"] = df["timestamp_local"].dt.floor("30min")
 
     hh = (
         df.groupby("slot_start", as_index=False)
@@ -311,7 +318,9 @@ def calculate_agile(hh: pd.DataFrame, agile_import: pd.DataFrame, agile_export: 
         on="slot_start", how="left"
     )
     if df["agile_import_p_per_kwh"].isna().any() or df["agile_export_p_per_kwh"].isna().any():
-        raise ValueError("Missing Agile prices for some slots")
+        missing = df["agile_import_p_per_kwh"].isna().sum() + df["agile_export_p_per_kwh"].isna().sum()
+        print(f"  Warning: dropping {missing} slots with missing Agile prices")
+        df = df.dropna(subset=["agile_import_p_per_kwh", "agile_export_p_per_kwh"]).copy()
 
     df["date"] = df["slot_start"].dt.date
     df["extra_kwh"] = build_extra_profile(df["slot_start"], scenario.extra_daily_kwh, scenario.extra_start, scenario.extra_end)
@@ -440,7 +449,11 @@ def run_compare(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Compare Tesla Powerwall usage against Octopus tariffs with sane defaults.")
+    parser = argparse.ArgumentParser(
+        description="Compare Tesla Powerwall usage against Octopus tariffs with sane defaults.",
+        epilog="Use --download-data to automatically download Powerwall data using teslapy. "
+               "This will prompt for Tesla login and save power data to download/ directory.",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     default = sub.add_parser("default", help="Simplest first run")
@@ -491,6 +504,9 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--agile-flex-max-kw", type=float, default=3.3)
     compare.add_argument("--no-ev-exclusion", action="store_true")
 
+    download = sub.add_parser("download-data", help="Download Powerwall data using teslapy")
+    download.add_argument("--email", required=True, help="Tesla account email address")
+
     regions = sub.add_parser("list-regions", help="Show supported region codes")
     regions.add_argument("--json", action="store_true")
 
@@ -505,6 +521,8 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.command == "download-data":
+        return run_download_data(args)
     if args.command in {"default", "compare"}:
         return run_compare(args)
     if args.command == "list-regions":
@@ -518,6 +536,168 @@ def main(argv=None) -> int:
         in_path, out_path = download_region_tariffs(args.region_code, Path(args.cache_dir), force=True)
         print(f"Downloaded:\n- {in_path}\n- {out_path}")
         return 0
+    return 0
+
+
+def _format_tz_date(dt) -> str:
+    """Format a datetime with proper ISO timezone (e.g. +01:00 not +0100)."""
+    s = dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+    return re.sub(r'([+-])(\d{2})(\d{2})$', r'\1\2:\3', s)
+
+
+def run_download_data(args) -> int:
+    """Download Powerwall 5-minute power data day-by-day, merge, and run comparison."""
+    import time as _time
+    import traceback
+    from datetime import datetime, timedelta
+
+    try:
+        import teslapy
+    except ImportError:
+        print("Error: teslapy library not installed. Run: pip install teslapy", file=sys.stderr)
+        return 1
+
+    print(f"Logging in to Tesla as {args.email}...")
+    tesla = teslapy.Tesla(args.email, retry=2, timeout=10)
+
+    if not tesla.authorized:
+        print("STEP 1: Log in to Tesla. Open this page in your browser:\n")
+        print(tesla.authorization_url())
+        print()
+        print("After successful login, you will get a Page Not Found error. That's expected.")
+        print("Just copy the url of that page and paste it here:")
+        tesla.fetch_token(authorization_response=input("URL after authentication: "))
+        print("\nSuccess!")
+
+    for product in tesla.api("PRODUCT_LIST")["response"]:
+        resource_type = product.get("resource_type")
+        if resource_type not in ("battery", "solar"):
+            continue
+
+        site_id = product["energy_site_id"]
+        print(f"\nFound {resource_type} site {site_id}")
+
+        # Get site config for timezone and installation date
+        site_config = tesla.api("SITE_CONFIG", path_vars={"site_id": site_id})["response"]
+        timezone = site_config.get("installation_time_zone", "Europe/London")
+        tz = ZoneInfo(timezone)
+
+        installation_date_str = site_config.get("installation_date", "")
+        if installation_date_str:
+            installation_date = pd.Timestamp(installation_date_str)
+            if installation_date.tzinfo is None:
+                installation_date = installation_date.tz_localize(tz)
+            else:
+                installation_date = installation_date.tz_convert(tz)
+        else:
+            installation_date = pd.Timestamp.now(tz) - pd.Timedelta(days=365)
+
+        # Limit to 1 year back or installation date, whichever is more recent
+        one_year_ago = pd.Timestamp.now(tz) - pd.Timedelta(days=365)
+        earliest = max(installation_date, one_year_ago)
+
+        power_dir = Path(f"download/{site_id}/power")
+        power_dir.mkdir(parents=True, exist_ok=True)
+
+        # Download day-by-day, skipping days already on disk
+        now = datetime.now(tz)
+        current_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        partial_day = True  # today is always partial
+        days_downloaded = 0
+        days_skipped = 0
+
+        print(f"  Downloading 5-minute power data from {earliest.strftime('%Y-%m-%d')} to {current_day.strftime('%Y-%m-%d')}...")
+
+        while current_day >= earliest:
+            date_str = current_day.strftime("%Y-%m-%d")
+            csv_path = power_dir / f"{date_str}.csv"
+
+            # Skip if already downloaded (unless it's today's partial file)
+            if not partial_day and csv_path.exists():
+                days_skipped += 1
+                current_day -= timedelta(days=1)
+                current_day = current_day.replace(tzinfo=None)
+                current_day = tz.localize(current_day) if hasattr(tz, 'localize') else current_day.replace(tzinfo=tz)
+                continue
+
+            # Remove stale partial file for today
+            partial_path = power_dir / f"{date_str}.partial.csv"
+            if partial_day:
+                partial_path.unlink(missing_ok=True)
+                csv_path.unlink(missing_ok=True)
+
+            print(f"    {date_str}{'  (partial)' if partial_day else ''}")
+
+            try:
+                day_start = current_day.replace(hour=0, minute=0, second=0, microsecond=0)
+                day_end = current_day.replace(hour=23, minute=59, second=59, microsecond=0)
+
+                response = tesla.api(
+                    "CALENDAR_HISTORY_DATA",
+                    path_vars={"site_id": site_id},
+                    kind="power",
+                    period="day",
+                    start_date=_format_tz_date(day_start),
+                    end_date=_format_tz_date(day_end),
+                    time_zone=timezone,
+                )
+
+                if response and "time_series" in response["response"]:
+                    ts = response["response"]["time_series"]
+                    for row in ts:
+                        row["load_power"] = (
+                            row["solar_power"] + row["battery_power"]
+                            + row["grid_power"] + row.get("generator_power", 0)
+                        )
+                    df_day = pd.DataFrame(ts)
+                    save_path = partial_path if partial_day else csv_path
+                    df_day.to_csv(save_path, index=False)
+                    days_downloaded += 1
+            except Exception:
+                traceback.print_exc()
+
+            _time.sleep(1)
+            partial_day = False
+            current_day -= timedelta(days=1)
+            # Re-localize after subtracting to handle DST transitions
+            current_day = current_day.replace(tzinfo=None)
+            current_day = current_day.replace(tzinfo=tz)
+
+        print(f"\n  Done: {days_downloaded} days downloaded, {days_skipped} skipped (already on disk)")
+
+        # Merge all per-day CSVs into one combined file
+        print("  Merging per-day files into combined power.csv...")
+        csv_files = sorted(power_dir.glob("*.csv"))
+        if not csv_files:
+            print("  No data files found.")
+            continue
+
+        frames = []
+        for f in csv_files:
+            try:
+                frames.append(pd.read_csv(f))
+            except Exception:
+                print(f"    Warning: could not read {f.name}, skipping")
+
+        if not frames:
+            print("  No valid data files found.")
+            continue
+
+        combined = pd.concat(frames, ignore_index=True)
+        combined["timestamp"] = pd.to_datetime(combined["timestamp"], utc=True)
+        combined = combined.sort_values("timestamp").drop_duplicates(subset=["timestamp"])
+        combined_path = Path(f"download/{site_id}/power.csv")
+        combined.to_csv(combined_path, index=False)
+        print(f"  Saved {len(combined)} rows to {combined_path}")
+        print(f"  Date range: {combined['timestamp'].min()} to {combined['timestamp'].max()}")
+
+        # Clean up per-day files now that the merged CSV exists
+        print("  Cleaning up per-day files...")
+        import shutil
+        shutil.rmtree(power_dir)
+        print(f"  Removed {power_dir}")
+
+    print("\nDownload complete!")
     return 0
 
 

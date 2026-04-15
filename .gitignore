@@ -1,1 +1,26 @@
+# Databases
 sqlite_mcp_server.db
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Tesla credentials, tokens and scripts
+tesla/
+cache.json
+
+# Downloaded data and cached tariffs
+download/
+.cache/
+output/
+
+# Backup files
+*.bak
+*.swp
+
+# Tesla usage script (third-party, not part of this project)
+tesla_usage.py
