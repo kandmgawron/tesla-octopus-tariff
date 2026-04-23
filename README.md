@@ -7,7 +7,7 @@ This version improves two things:
 - it downloads the latest Agile and Agile Outgoing CSVs directly from the public Energy Stats CSV index
 - it adds a `default` command so first-time use needs far fewer flags
 
-The Energy Stats CSV index exposes region-coded `csv_agile_*` and `csv_agileoutgoing_*` files, so the script can fetch them automatically instead of asking users to download them first. citeturn227673view0
+The Energy Stats CSV index exposes region-coded `csv_agile_*` and `csv_agileoutgoing_*` files, so the script can fetch them automatically instead of asking users to download them first. 
 
 ## Install
 
