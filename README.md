@@ -1,6 +1,18 @@
 # Octopus Powerwall Tariff Compare
 
-A Python CLI that downloads your Tesla Powerwall usage data and compares Octopus Intelligent vs Agile tariffs to show which is cheaper for you.
+A Python CLI that downloads your Tesla Powerwall usage data and compares all major Octopus Energy tariffs to show which is cheapest for you.
+
+## Supported Tariffs
+
+| Tariff | Type | Description |
+|--------|------|-------------|
+| **Intelligent** | Time-of-use | Cheap overnight rate (23:30–05:30) for smart EV/battery owners |
+| **Agile** | Half-hourly variable | Prices change every 30 minutes based on wholesale market |
+| **Go** | Time-of-use | Simple cheap overnight rate for EV owners |
+| **Flux** | 3-band import+export | Designed for solar+battery with peak export premium |
+| **Cosy** | 3 cheap windows | Designed for heat pumps (04:00–07:00, 13:00–16:00, 22:00–00:00) |
+| **Tracker** | Daily variable | Single rate per day tied to wholesale prices |
+| **Flexible (SVR)** | Flat rate | Standard variable rate — the default tariff |
 
 ## Install
 
@@ -37,12 +49,22 @@ Data is saved to `download/power.csv`. Per-day files are cached in `download/pow
 python octopus_powerwall_tariff_compare.py default
 ```
 
-This automatically refreshes your Powerwall data (downloads any new days), then runs the comparison. If no data exists yet, it downloads everything and tells you how long it will take (~10 minutes per year).
+This automatically refreshes your Powerwall data (downloads any new days), then compares all 7 Octopus tariffs. If no data exists yet, it downloads everything and tells you how long it will take (~10 minutes per year).
 
 You can also skip the auto-download and just compare existing data:
 
 ```bash
 python octopus_powerwall_tariff_compare.py compare --power-csv download/power.csv
+```
+
+To compare only specific tariffs:
+
+```bash
+# Just compare Go vs Intelligent
+python octopus_powerwall_tariff_compare.py compare --power-csv download/power.csv --tariffs intelligent,go
+
+# All variable tariffs
+python octopus_powerwall_tariff_compare.py compare --power-csv download/power.csv --tariffs agile,tracker
 ```
 
 ### All-in-one: download + refresh tariffs + compare
@@ -118,9 +140,14 @@ python octopus_powerwall_tariff_compare.py list-regions
 
 Results are written to the `output/` directory:
 
-- `summary.csv` - Side-by-side tariff comparison
+- `summary.csv` - Side-by-side tariff comparison (all tariffs ranked by net cost)
 - `daily_breakdown_intelligent.csv` - Daily costs on Intelligent
 - `daily_breakdown_agile.csv` - Daily costs on Agile
+- `daily_breakdown_go.csv` - Daily costs on Go
+- `daily_breakdown_flux.csv` - Daily costs on Flux
+- `daily_breakdown_cosy.csv` - Daily costs on Cosy
+- `daily_breakdown_flexible.csv` - Daily costs on Flexible (SVR)
+- `daily_breakdown_tracker.csv` - Daily costs on Tracker
 - `model_summary.csv` - Combined scenario comparison (when using `model`)
 
 ## Default Assumptions
@@ -129,12 +156,41 @@ Results are written to the `output/` directory:
 |---------|---------|-------------|
 | Region | M (Yorkshire) | Octopus pricing region |
 | Battery | 13 kWh | Single Powerwall 2 usable capacity |
-| Intelligent off-peak | 7p/kWh | Import rate 23:30-05:30 |
-| Intelligent peak | 26p/kWh | Import rate outside off-peak |
-| Intelligent export | 15p/kWh | Export rate |
-| Intelligent standing | 57.01p/day | Daily standing charge |
-| Agile standing | 66.26p/day | Daily standing charge |
-| EV detection | Enabled | Excludes >5.5kW draws between 23:30-04:30 |
+| **Intelligent** | | |
+| Off-peak rate | 7p/kWh | Import rate 23:30–05:30 |
+| Peak rate | 26p/kWh | Import rate outside off-peak |
+| Export rate | 15p/kWh | Export rate |
+| Standing charge | 57.01p/day | Daily standing charge |
+| **Go** | | |
+| Off-peak rate | 8p/kWh | Import rate 23:30–05:30 |
+| Peak rate | 24.5p/kWh | Import rate outside off-peak |
+| Export rate | 12p/kWh | Export rate |
+| Standing charge | 53.35p/day | Daily standing charge |
+| **Flux** | | |
+| Off-peak import | 9.80p/kWh | 02:00–05:00 |
+| Day import | 22.36p/kWh | Outside peak and off-peak |
+| Peak import | 33.54p/kWh | 16:00–19:00 |
+| Off-peak export | 4.05p/kWh | 02:00–05:00 |
+| Day export | 14.40p/kWh | Outside peak and off-peak |
+| Peak export | 28.60p/kWh | 16:00–19:00 |
+| Standing charge | 48.93p/day | Daily standing charge |
+| **Cosy** | | |
+| Cosy rate | 12p/kWh | 04:00–07:00, 13:00–16:00, 22:00–00:00 |
+| Day rate | 24.50p/kWh | Standard hours |
+| Peak rate | 36.75p/kWh | 16:00–19:00 |
+| Export rate | 12p/kWh | Export rate |
+| Standing charge | 53.35p/day | Daily standing charge |
+| **Tracker** | | |
+| Import rate | Daily variable | Fetched from Octopus API |
+| Export rate | 12p/kWh | Export rate |
+| Standing charge | 53.35p/day | Daily standing charge |
+| **Flexible (SVR)** | | |
+| Import rate | 24.50p/kWh | Flat rate |
+| Export rate | 12p/kWh | Export rate |
+| Standing charge | 53.35p/day | Daily standing charge |
+| **Agile** | | |
+| Standing charge | 66.26p/day | Daily standing charge |
+| EV detection | Enabled | Excludes >5.5kW draws between 23:30–04:30 |
 
 All defaults can be overridden via `set-defaults` or on the command line.
 

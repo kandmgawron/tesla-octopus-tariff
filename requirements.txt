@@ -1,4 +1,5 @@
 pandas>=2.2.0
 numpy>=1.26.0
+requests>=2.31.0
 teslapy>=2.9.0
 pypowerwall>=0.8.0
