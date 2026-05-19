@@ -150,7 +150,10 @@ def region_name_from_code(region_code: str) -> str:
     return REGION_CODE_TO_NAME[code]
 
 
-def download_region_tariffs(region_code: str, cache_dir: Path, index_url: str = DEFAULT_TARIFF_INDEX, force: bool = False) -> Tuple[Path, Path]:
+def download_region_tariffs(
+    region_code: str, cache_dir: Path,
+    index_url: str = DEFAULT_TARIFF_INDEX, force: bool = False,
+) -> Tuple[Path, Path]:
     region_code = region_code.upper()
     region_name = region_name_from_code(region_code)
     import_name = f"csv_agile_{region_code}_{region_name}.csv"
@@ -213,7 +216,12 @@ def load_power_csv(path: Path, scenario: ScenarioConfig) -> pd.DataFrame:
 
     if scenario.ev_exclusion_enabled:
         df["is_car_charging"] = df.apply(
-            lambda row: row["grid_power"] >= scenario.ev_min_power_w and time_in_window(row["timestamp_local"], scenario.ev_start, scenario.ev_end),
+            lambda row: (
+                row["grid_power"] >= scenario.ev_min_power_w
+                and time_in_window(
+                    row["timestamp_local"], scenario.ev_start, scenario.ev_end
+                )
+            ),
             axis=1,
         )
     else:
@@ -344,7 +352,11 @@ def _allocate_flexible_energy_to_cheapest_slots(day_df: pd.DataFrame, flexible_k
     return alloc
 
 
-def calculate_agile(hh: pd.DataFrame, agile_import: pd.DataFrame, agile_export: pd.DataFrame, config: AgileConfig, scenario: ScenarioConfig):
+def calculate_agile(
+    hh: pd.DataFrame, agile_import: pd.DataFrame,
+    agile_export: pd.DataFrame, config: AgileConfig,
+    scenario: ScenarioConfig,
+):
     df = hh.copy()
     df = df.merge(
         agile_import[["slot_start", "price_p_per_kwh"]].rename(columns={"price_p_per_kwh": "agile_import_p_per_kwh"}),
@@ -885,14 +897,16 @@ def run_model(args) -> int:
     total_extra_kwh = 0.0
     scenario_descriptions = []
 
-    for i, (label, kwh, window) in enumerate(zip(labels, adjust_kwhs, windows)):
+    for i, (label, kwh, window) in enumerate(zip(labels, adjust_kwhs, windows, strict=True)):
         total_extra_kwh += kwh
         start_hhmm, end_hhmm = window.split("-")
         scenario_descriptions.append(f"{label}: {'+' if kwh >= 0 else ''}{kwh} kWh/day ({window})")
 
         print()
         print("=" * 60)
-        scenario_name = " + ".join(l for l, _ in zip(labels[:i+1], adjust_kwhs[:i+1]))
+        scenario_name = " + ".join(
+            name for name in labels[:i+1]
+        )
         print(f"SCENARIO: {scenario_name}")
         for desc in scenario_descriptions:
             print(f"  {desc}")
@@ -965,7 +979,8 @@ def run_download_data(args) -> int:
     try:
         import teslapy
     except ImportError:
-        print("Error: teslapy library not installed. Run: pip install teslapy", file=sys.stderr)
+        import sys as _sys
+        print("Error: teslapy library not installed. Run: pip install teslapy", file=_sys.stderr)
         return 1
 
     print(f"Logging in to Tesla as {args.email}...")
@@ -1101,12 +1116,6 @@ def run_download_data(args) -> int:
         combined.to_csv(combined_path, index=False)
         print(f"  Saved {len(combined)} rows to {combined_path}")
         print(f"  Date range: {combined['timestamp'].min()} to {combined['timestamp'].max()}")
-
-        # Clean up per-day files now that the merged CSV exists
-        print("  Cleaning up per-day files...")
-        import shutil
-        shutil.rmtree(power_dir)
-        print(f"  Removed {power_dir}")
 
     print("\nDownload complete!")
     return 0

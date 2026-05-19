@@ -14,6 +14,9 @@ tesla/
 cache.json
 .octopus_defaults.json
 
+# Kiro steering files
+.kiro/
+
 # Downloaded data and cached tariffs
 download/
 .cache/
