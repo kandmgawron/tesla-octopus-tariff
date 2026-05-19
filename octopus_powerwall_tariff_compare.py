@@ -550,9 +550,12 @@ def build_parser() -> argparse.ArgumentParser:
     default = sub.add_parser("default",
         help="Quick comparison using sensible defaults",
         description="Run a tariff comparison with minimal configuration. "
+                    "Automatically refreshes Powerwall data from Tesla if --email is saved. "
                     "Uses saved defaults from set-defaults where available.")
-    default.add_argument("--power-csv", required=True,
-        help="Path to Powerwall power CSV (5-min intervals with timestamp and grid_power columns)")
+    default.add_argument("--power-csv", default="download/power.csv",
+        help="Path to Powerwall power CSV (default: %(default)s)")
+    default.add_argument("--email", default=d("email", None),
+        help="Tesla email - if provided, auto-downloads latest data before comparing")
     default.add_argument("--out-dir", default=d("out_dir", "output"),
         help="Directory for output CSVs (default: %(default)s)")
     default.add_argument("--cache-dir", default=d("cache_dir", ".cache/tariffs"),
@@ -766,6 +769,26 @@ def main(argv=None) -> int:
     if args.command == "model":
         return run_model(args)
     if args.command in {"default", "compare"}:
+        # Auto-download latest data if email is available and using default power-csv path
+        if args.command == "default" and getattr(args, "email", None):
+            power_csv_path = Path(args.power_csv)
+            if str(power_csv_path) == "download/power.csv":
+                print("Refreshing Powerwall data from Tesla...\n")
+                rc = run_download_data(args)
+                if rc != 0:
+                    return rc
+                print()
+            elif not power_csv_path.exists():
+                print(f"Error: {args.power_csv} not found.")
+                print("Run with --email to download data, or specify a valid --power-csv path.")
+                return 1
+        elif args.command == "default" and not Path(args.power_csv).exists():
+            print(f"Error: {args.power_csv} not found.")
+            print("Either:")
+            print("  1. Save your email: set-defaults --email you@example.com")
+            print("     Then run 'default' again to auto-download from Tesla")
+            print("  2. Specify a CSV: default --power-csv /path/to/power.csv")
+            return 1
         return run_compare(args)
     if args.command == "list-regions":
         if args.json:
@@ -831,11 +854,10 @@ def run_full_refresh(args) -> int:
 
     # Find the downloaded power CSV
     download_dir = Path("download")
-    power_csvs = list(download_dir.glob("*/power.csv"))
-    if not power_csvs:
+    power_csv = download_dir / "power.csv"
+    if not power_csv.exists():
         print("Error: No power.csv found after download")
         return 1
-    power_csv = power_csvs[0]
 
     # Step 2: Refresh tariffs
     print()
@@ -1022,17 +1044,48 @@ def run_download_data(args) -> int:
         one_year_ago = pd.Timestamp.now(tz) - pd.Timedelta(days=365)
         earliest = max(installation_date, one_year_ago)
 
-        power_dir = Path(f"download/{site_id}/power")
+        power_dir = Path("download/power")
         power_dir.mkdir(parents=True, exist_ok=True)
 
         # Download day-by-day, skipping days already on disk
         now = datetime.now(tz)
         current_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
         partial_day = True  # today is always partial
+
+        # Count how many days need downloading
+        days_to_check = []
+        check_day = current_day
+        while check_day >= earliest:
+            date_str = check_day.strftime("%Y-%m-%d")
+            csv_path = power_dir / f"{date_str}.csv"
+            if not csv_path.exists():
+                days_to_check.append(check_day)
+            check_day -= timedelta(days=1)
+            check_day = check_day.replace(tzinfo=None).replace(tzinfo=tz)
+
+        # Always re-download today
+        days_needing_download = len(days_to_check)
+        if days_needing_download == 0:
+            days_needing_download = 1  # at least today's partial
+
+        total_days = (current_day - earliest).days + 1
+        existing_days = total_days - len(days_to_check)
+
+        if existing_days == 0:
+            est_minutes = (days_needing_download * 1.5) / 60
+            print(f"  No existing data found. Downloading {days_needing_download} days.")
+            print(f"  Estimated time: ~{est_minutes:.0f} minutes")
+        elif days_needing_download <= 1:
+            print(f"  Data up to date ({existing_days} days cached). Refreshing today...")
+        else:
+            est_minutes = (days_needing_download * 1.5) / 60
+            print(f"  {existing_days} days cached, {days_needing_download} days to download.")
+            print(f"  Estimated time: ~{est_minutes:.0f} minutes")
+
+        print(f"  Date range: {earliest.strftime('%Y-%m-%d')} to {current_day.strftime('%Y-%m-%d')}")
+
         days_downloaded = 0
         days_skipped = 0
-
-        print(f"  Downloading 5-minute power data from {earliest.strftime('%Y-%m-%d')} to {current_day.strftime('%Y-%m-%d')}...")
 
         while current_day >= earliest:
             date_str = current_day.strftime("%Y-%m-%d")
@@ -1042,8 +1095,7 @@ def run_download_data(args) -> int:
             if not partial_day and csv_path.exists():
                 days_skipped += 1
                 current_day -= timedelta(days=1)
-                current_day = current_day.replace(tzinfo=None)
-                current_day = tz.localize(current_day) if hasattr(tz, 'localize') else current_day.replace(tzinfo=tz)
+                current_day = current_day.replace(tzinfo=None).replace(tzinfo=tz)
                 continue
 
             # Remove stale partial file for today
@@ -1085,14 +1137,12 @@ def run_download_data(args) -> int:
             _time.sleep(1)
             partial_day = False
             current_day -= timedelta(days=1)
-            # Re-localize after subtracting to handle DST transitions
-            current_day = current_day.replace(tzinfo=None)
-            current_day = current_day.replace(tzinfo=tz)
+            current_day = current_day.replace(tzinfo=None).replace(tzinfo=tz)
 
         print(f"\n  Done: {days_downloaded} days downloaded, {days_skipped} skipped (already on disk)")
 
         # Merge all per-day CSVs into one combined file
-        print("  Merging per-day files into combined power.csv...")
+        print("  Merging into download/power.csv...")
         csv_files = sorted(power_dir.glob("*.csv"))
         if not csv_files:
             print("  No data files found.")
@@ -1112,7 +1162,7 @@ def run_download_data(args) -> int:
         combined = pd.concat(frames, ignore_index=True)
         combined["timestamp"] = pd.to_datetime(combined["timestamp"], utc=True)
         combined = combined.sort_values("timestamp").drop_duplicates(subset=["timestamp"])
-        combined_path = Path(f"download/{site_id}/power.csv")
+        combined_path = Path("download/power.csv")
         combined.to_csv(combined_path, index=False)
         print(f"  Saved {len(combined)} rows to {combined_path}")
         print(f"  Date range: {combined['timestamp'].min()} to {combined['timestamp'].max()}")
