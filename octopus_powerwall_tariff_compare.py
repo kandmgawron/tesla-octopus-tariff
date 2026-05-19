@@ -1102,12 +1102,6 @@ def run_download_data(args) -> int:
         print(f"  Saved {len(combined)} rows to {combined_path}")
         print(f"  Date range: {combined['timestamp'].min()} to {combined['timestamp'].max()}")
 
-        # Clean up per-day files now that the merged CSV exists
-        print("  Cleaning up per-day files...")
-        import shutil
-        shutil.rmtree(power_dir)
-        print(f"  Removed {power_dir}")
-
     print("\nDownload complete!")
     return 0
 
