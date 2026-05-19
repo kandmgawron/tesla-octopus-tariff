@@ -144,7 +144,11 @@ The `download-data` and `full-refresh` commands use the [TeslaPy](https://github
 
 1. A URL is printed - open it in your browser
 2. Log in to your Tesla account
-3. You'll get a "Page Not Found" error - this is expected
-4. Copy the full URL from your browser's address bar and paste it back
+3. You'll see a **"Verified Successfully"** page - the page will then hang (this is expected)
+4. Open your browser's **Developer Tools** (Cmd+Option+I on Mac, F12 on Windows)
+5. Go to the **Console** tab
+6. Find the message: `Failed to launch 'tesla://auth/callback?code=...'`
+7. Right-click the `tesla://auth/callback?...` URL and choose **Copy link address**
+8. Paste the full URL into the terminal
 
 Your token is cached locally so you won't need to log in again unless it expires.

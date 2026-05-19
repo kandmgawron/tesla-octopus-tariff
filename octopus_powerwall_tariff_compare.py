@@ -1007,14 +1007,33 @@ def run_download_data(args) -> int:
 
     print(f"Logging in to Tesla as {args.email}...")
     tesla = teslapy.Tesla(args.email, retry=2, timeout=10)
+    # Tesla deprecated the https://auth.tesla.com/void/callback redirect URI;
+    # the Tesla app's tesla://auth/callback is the only redirect still
+    # registered for the ownerapi client_id.
+    tesla.redirect_uri = "tesla://auth/callback"
 
     if not tesla.authorized:
         print("STEP 1: Log in to Tesla. Open this page in your browser:\n")
         print(tesla.authorization_url())
         print()
-        print("After successful login, you will get a Page Not Found error. That's expected.")
-        print("Just copy the url of that page and paste it here:")
-        tesla.fetch_token(authorization_response=input("URL after authentication: "))
+        print("After successful login, you will see a 'Verified Successfully' page.")
+        print("Most browsers won't navigate to the tesla:// URL, so you need to")
+        print("copy it from the browser's developer console:")
+        print("  1. Open developer tools and switch to the Console tab")
+        print("     (Chrome: View > Developer > Developer Tools)")
+        print('  2. Find the message "Failed to launch \'tesla://auth/callback?...\'" or similar')
+        print("  3. Right-click the tesla://auth/callback?... URL and choose 'Copy link address'")
+        print()
+        print("The URL should look like: tesla://auth/callback?code=NA_abcd12345...&issuer=...")
+        print()
+        auth_response = input("Paste the URL here: ")
+        # oauthlib refuses to parse non-https authorization responses. Only the
+        # code/state query params are read from this URL, so rewriting the
+        # scheme is safe.
+        auth_response = auth_response.replace(
+            "tesla://auth/callback", "https://auth.tesla.com/void/callback", 1
+        )
+        tesla.fetch_token(authorization_response=auth_response)
         print("\nSuccess!")
 
     for product in tesla.api("PRODUCT_LIST")["response"]:
