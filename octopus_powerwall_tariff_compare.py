@@ -32,6 +32,17 @@ SAVEABLE_DEFAULTS = {
     "intelligent_offpeak_start", "intelligent_offpeak_end",
     "agile_standing_charge", "agile_flex_hours", "agile_flex_max_kw",
     "ev_exclusion_enabled", "ev_min_power_w", "ev_start", "ev_end",
+    "go_offpeak_import", "go_peak_import", "go_export", "go_standing_charge",
+    "go_offpeak_start", "go_offpeak_end",
+    "flux_offpeak_import", "flux_day_import", "flux_peak_import",
+    "flux_offpeak_export", "flux_day_export", "flux_peak_export",
+    "flux_standing_charge", "flux_offpeak_start", "flux_offpeak_end",
+    "flux_peak_start", "flux_peak_end",
+    "cosy_import", "cosy_day_import", "cosy_peak_import",
+    "cosy_export", "cosy_standing_charge",
+    "flexible_import", "flexible_export", "flexible_standing_charge",
+    "tracker_standing_charge", "tracker_export",
+    "tariffs",
 }
 
 
@@ -85,6 +96,69 @@ class IntelligentTariff:
     standing_charge_p_per_day: float = 57.01
     offpeak_start: str = "23:30"
     offpeak_end: str = "05:30"
+
+
+@dataclass
+class GoTariff:
+    """Octopus Go — cheap overnight rate for EV owners."""
+    offpeak_import_p_per_kwh: float = 8.0
+    peak_import_p_per_kwh: float = 24.5
+    export_p_per_kwh: float = 12.0
+    standing_charge_p_per_day: float = 53.35
+    offpeak_start: str = "23:30"
+    offpeak_end: str = "05:30"
+
+
+@dataclass
+class FluxTariff:
+    """Octopus Flux — 3 time bands for import and export, designed for solar+battery."""
+    offpeak_import_p_per_kwh: float = 9.80
+    day_import_p_per_kwh: float = 22.36
+    peak_import_p_per_kwh: float = 33.54
+    offpeak_export_p_per_kwh: float = 4.05
+    day_export_p_per_kwh: float = 14.40
+    peak_export_p_per_kwh: float = 28.60
+    standing_charge_p_per_day: float = 48.93
+    offpeak_start: str = "02:00"
+    offpeak_end: str = "05:00"
+    peak_start: str = "16:00"
+    peak_end: str = "19:00"
+
+
+@dataclass
+class CosyTariff:
+    """Octopus Cosy — 3 cheap windows for heat pumps, peak 16:00-19:00."""
+    cosy_import_p_per_kwh: float = 12.0
+    day_import_p_per_kwh: float = 24.50
+    peak_import_p_per_kwh: float = 36.75
+    export_p_per_kwh: float = 12.0
+    standing_charge_p_per_day: float = 53.35
+    # Cosy windows (cheap rate)
+    cosy_window_1_start: str = "04:00"
+    cosy_window_1_end: str = "07:00"
+    cosy_window_2_start: str = "13:00"
+    cosy_window_2_end: str = "16:00"
+    cosy_window_3_start: str = "22:00"
+    cosy_window_3_end: str = "00:00"
+    # Peak window (expensive rate)
+    peak_start: str = "16:00"
+    peak_end: str = "19:00"
+
+
+@dataclass
+class FlexibleTariff:
+    """Octopus Flexible (SVR) — flat rate standard variable tariff."""
+    import_p_per_kwh: float = 24.50
+    export_p_per_kwh: float = 12.0
+    standing_charge_p_per_day: float = 53.35
+
+
+@dataclass
+class TrackerTariff:
+    """Octopus Tracker — daily variable rate tied to wholesale prices."""
+    standing_charge_p_per_day: float = 53.35
+    export_p_per_kwh: float = 12.0
+    # Tracker uses daily rates from CSV/API — no fixed import rate
 
 
 @dataclass
@@ -434,6 +508,389 @@ def calculate_agile(
     return summary, pd.DataFrame(daily_rows)
 
 
+def calculate_go(hh: pd.DataFrame, tariff: GoTariff, scenario: ScenarioConfig):
+    """Calculate costs on Octopus Go tariff (cheap overnight, flat peak)."""
+    df = hh.copy()
+    df["date"] = df["slot_start"].dt.date
+    df["extra_kwh"] = build_extra_profile(df["slot_start"], scenario.extra_daily_kwh, scenario.extra_start, scenario.extra_end)
+    df["is_offpeak"] = df["slot_start"].apply(lambda ts: time_in_window(ts, tariff.offpeak_start, tariff.offpeak_end))
+
+    daily_rows = []
+    total_import_cost_p = total_export_revenue_p = total_sc_p = 0.0
+
+    for day, group in df.groupby("date", sort=True):
+        group = group.copy().sort_values("slot_start")
+        offpeak_import = group.loc[group["is_offpeak"], "total_import_kwh"].sum()
+        peak_import = group.loc[~group["is_offpeak"], "total_import_kwh"].sum()
+        export_kwh = group["export_kwh"].sum()
+        extra_kwh = group["extra_kwh"].sum()
+
+        # Extra consumption: battery covers cheap slots first
+        battery_cheap_available = scenario.battery_capacity_kwh
+        total_non_car = offpeak_import + peak_import
+        cheap_covered = min(total_non_car, battery_cheap_available)
+        remaining_battery = max(battery_cheap_available - cheap_covered, 0.0)
+        extra_cheap_kwh = min(extra_kwh, remaining_battery)
+        extra_expensive_kwh = max(extra_kwh - remaining_battery, 0.0)
+
+        import_cost_p = (
+            offpeak_import * tariff.offpeak_import_p_per_kwh
+            + peak_import * tariff.peak_import_p_per_kwh
+            + extra_cheap_kwh * tariff.offpeak_import_p_per_kwh
+            + extra_expensive_kwh * tariff.peak_import_p_per_kwh
+        )
+        export_revenue_p = export_kwh * tariff.export_p_per_kwh
+        sc_p = tariff.standing_charge_p_per_day
+
+        total_import_cost_p += import_cost_p
+        total_export_revenue_p += export_revenue_p
+        total_sc_p += sc_p
+
+        daily_rows.append({
+            "date": day,
+            "offpeak_import_kwh": round(offpeak_import, 4),
+            "peak_import_kwh": round(peak_import, 4),
+            "extra_kwh": round(extra_kwh, 4),
+            "extra_cheap_kwh": round(extra_cheap_kwh, 4),
+            "extra_expensive_kwh": round(extra_expensive_kwh, 4),
+            "export_kwh": round(export_kwh, 4),
+            "import_cost_p": round(import_cost_p, 4),
+            "export_revenue_p": round(export_revenue_p, 4),
+            "standing_charge_p": round(sc_p, 4),
+            "net_cost_p": round(import_cost_p + sc_p - export_revenue_p, 4),
+        })
+
+    summary = {
+        "tariff": "go",
+        "import_cost_gbp": round(pence_to_pounds(total_import_cost_p), 2),
+        "export_revenue_gbp": round(pence_to_pounds(total_export_revenue_p), 2),
+        "standing_charge_gbp": round(pence_to_pounds(total_sc_p), 2),
+        "net_cost_gbp": round(pence_to_pounds(total_import_cost_p + total_sc_p - total_export_revenue_p), 2),
+    }
+    return summary, pd.DataFrame(daily_rows)
+
+
+def _flux_band(ts: pd.Timestamp, tariff: FluxTariff) -> str:
+    """Determine which Flux time band a timestamp falls into."""
+    if time_in_window(ts, tariff.offpeak_start, tariff.offpeak_end):
+        return "offpeak"
+    if time_in_window(ts, tariff.peak_start, tariff.peak_end):
+        return "peak"
+    return "day"
+
+
+def calculate_flux(hh: pd.DataFrame, tariff: FluxTariff, scenario: ScenarioConfig):
+    """Calculate costs on Octopus Flux tariff (3 bands for import and export)."""
+    df = hh.copy()
+    df["date"] = df["slot_start"].dt.date
+    df["extra_kwh"] = build_extra_profile(df["slot_start"], scenario.extra_daily_kwh, scenario.extra_start, scenario.extra_end)
+    df["band"] = df["slot_start"].apply(lambda ts: _flux_band(ts, tariff))
+
+    import_rates = {"offpeak": tariff.offpeak_import_p_per_kwh, "day": tariff.day_import_p_per_kwh, "peak": tariff.peak_import_p_per_kwh}
+    export_rates = {"offpeak": tariff.offpeak_export_p_per_kwh, "day": tariff.day_export_p_per_kwh, "peak": tariff.peak_export_p_per_kwh}
+
+    daily_rows = []
+    total_import_cost_p = total_export_revenue_p = total_sc_p = 0.0
+
+    for day, group in df.groupby("date", sort=True):
+        group = group.copy().sort_values("slot_start")
+
+        import_cost_p = 0.0
+        export_revenue_p = 0.0
+        offpeak_import = day_import = peak_import = 0.0
+        extra_kwh = group["extra_kwh"].sum()
+
+        for band_name in ("offpeak", "day", "peak"):
+            band_mask = group["band"] == band_name
+            band_import = group.loc[band_mask, "total_import_kwh"].sum()
+            band_export = group.loc[band_mask, "export_kwh"].sum()
+            import_cost_p += band_import * import_rates[band_name]
+            export_revenue_p += band_export * export_rates[band_name]
+            if band_name == "offpeak":
+                offpeak_import = band_import
+            elif band_name == "day":
+                day_import = band_import
+            else:
+                peak_import = band_import
+
+        # Extra consumption charged at cheapest available rate (offpeak if battery covers it)
+        battery_cheap_available = scenario.battery_capacity_kwh
+        total_existing = offpeak_import + day_import + peak_import
+        remaining_battery = max(battery_cheap_available - total_existing, 0.0)
+        extra_cheap_kwh = min(extra_kwh, remaining_battery)
+        extra_expensive_kwh = max(extra_kwh - remaining_battery, 0.0)
+        import_cost_p += extra_cheap_kwh * tariff.offpeak_import_p_per_kwh + extra_expensive_kwh * tariff.day_import_p_per_kwh
+
+        sc_p = tariff.standing_charge_p_per_day
+        total_import_cost_p += import_cost_p
+        total_export_revenue_p += export_revenue_p
+        total_sc_p += sc_p
+
+        daily_rows.append({
+            "date": day,
+            "offpeak_import_kwh": round(offpeak_import, 4),
+            "day_import_kwh": round(day_import, 4),
+            "peak_import_kwh": round(peak_import, 4),
+            "extra_kwh": round(extra_kwh, 4),
+            "export_kwh": round(group["export_kwh"].sum(), 4),
+            "import_cost_p": round(import_cost_p, 4),
+            "export_revenue_p": round(export_revenue_p, 4),
+            "standing_charge_p": round(sc_p, 4),
+            "net_cost_p": round(import_cost_p + sc_p - export_revenue_p, 4),
+        })
+
+    summary = {
+        "tariff": "flux",
+        "import_cost_gbp": round(pence_to_pounds(total_import_cost_p), 2),
+        "export_revenue_gbp": round(pence_to_pounds(total_export_revenue_p), 2),
+        "standing_charge_gbp": round(pence_to_pounds(total_sc_p), 2),
+        "net_cost_gbp": round(pence_to_pounds(total_import_cost_p + total_sc_p - total_export_revenue_p), 2),
+    }
+    return summary, pd.DataFrame(daily_rows)
+
+
+def _cosy_band(ts: pd.Timestamp, tariff: CosyTariff) -> str:
+    """Determine which Cosy time band a timestamp falls into."""
+    if time_in_window(ts, tariff.peak_start, tariff.peak_end):
+        return "peak"
+    if (time_in_window(ts, tariff.cosy_window_1_start, tariff.cosy_window_1_end)
+            or time_in_window(ts, tariff.cosy_window_2_start, tariff.cosy_window_2_end)
+            or time_in_window(ts, tariff.cosy_window_3_start, tariff.cosy_window_3_end)):
+        return "cosy"
+    return "day"
+
+
+def calculate_cosy(hh: pd.DataFrame, tariff: CosyTariff, scenario: ScenarioConfig):
+    """Calculate costs on Octopus Cosy tariff (3 cheap windows, peak, standard)."""
+    df = hh.copy()
+    df["date"] = df["slot_start"].dt.date
+    df["extra_kwh"] = build_extra_profile(df["slot_start"], scenario.extra_daily_kwh, scenario.extra_start, scenario.extra_end)
+    df["band"] = df["slot_start"].apply(lambda ts: _cosy_band(ts, tariff))
+
+    import_rates = {"cosy": tariff.cosy_import_p_per_kwh, "day": tariff.day_import_p_per_kwh, "peak": tariff.peak_import_p_per_kwh}
+
+    daily_rows = []
+    total_import_cost_p = total_export_revenue_p = total_sc_p = 0.0
+
+    for day, group in df.groupby("date", sort=True):
+        group = group.copy().sort_values("slot_start")
+
+        import_cost_p = 0.0
+        cosy_import = day_import = peak_import = 0.0
+
+        for band_name in ("cosy", "day", "peak"):
+            band_mask = group["band"] == band_name
+            band_import = group.loc[band_mask, "total_import_kwh"].sum()
+            import_cost_p += band_import * import_rates[band_name]
+            if band_name == "cosy":
+                cosy_import = band_import
+            elif band_name == "day":
+                day_import = band_import
+            else:
+                peak_import = band_import
+
+        export_kwh = group["export_kwh"].sum()
+        extra_kwh = group["extra_kwh"].sum()
+
+        # Extra consumption: battery covers cheap slots first
+        battery_cheap_available = scenario.battery_capacity_kwh
+        total_existing = cosy_import + day_import + peak_import
+        remaining_battery = max(battery_cheap_available - total_existing, 0.0)
+        extra_cheap_kwh = min(extra_kwh, remaining_battery)
+        extra_expensive_kwh = max(extra_kwh - remaining_battery, 0.0)
+        import_cost_p += extra_cheap_kwh * tariff.cosy_import_p_per_kwh + extra_expensive_kwh * tariff.day_import_p_per_kwh
+
+        export_revenue_p = export_kwh * tariff.export_p_per_kwh
+        sc_p = tariff.standing_charge_p_per_day
+
+        total_import_cost_p += import_cost_p
+        total_export_revenue_p += export_revenue_p
+        total_sc_p += sc_p
+
+        daily_rows.append({
+            "date": day,
+            "cosy_import_kwh": round(cosy_import, 4),
+            "day_import_kwh": round(day_import, 4),
+            "peak_import_kwh": round(peak_import, 4),
+            "extra_kwh": round(extra_kwh, 4),
+            "export_kwh": round(export_kwh, 4),
+            "import_cost_p": round(import_cost_p, 4),
+            "export_revenue_p": round(export_revenue_p, 4),
+            "standing_charge_p": round(sc_p, 4),
+            "net_cost_p": round(import_cost_p + sc_p - export_revenue_p, 4),
+        })
+
+    summary = {
+        "tariff": "cosy",
+        "import_cost_gbp": round(pence_to_pounds(total_import_cost_p), 2),
+        "export_revenue_gbp": round(pence_to_pounds(total_export_revenue_p), 2),
+        "standing_charge_gbp": round(pence_to_pounds(total_sc_p), 2),
+        "net_cost_gbp": round(pence_to_pounds(total_import_cost_p + total_sc_p - total_export_revenue_p), 2),
+    }
+    return summary, pd.DataFrame(daily_rows)
+
+
+def calculate_flexible(hh: pd.DataFrame, tariff: FlexibleTariff, scenario: ScenarioConfig):
+    """Calculate costs on Octopus Flexible (SVR) — flat rate tariff."""
+    df = hh.copy()
+    df["date"] = df["slot_start"].dt.date
+    df["extra_kwh"] = build_extra_profile(df["slot_start"], scenario.extra_daily_kwh, scenario.extra_start, scenario.extra_end)
+
+    daily_rows = []
+    total_import_cost_p = total_export_revenue_p = total_sc_p = 0.0
+
+    for day, group in df.groupby("date", sort=True):
+        total_import = group["total_import_kwh"].sum()
+        export_kwh = group["export_kwh"].sum()
+        extra_kwh = group["extra_kwh"].sum()
+
+        import_cost_p = (total_import + extra_kwh) * tariff.import_p_per_kwh
+        export_revenue_p = export_kwh * tariff.export_p_per_kwh
+        sc_p = tariff.standing_charge_p_per_day
+
+        total_import_cost_p += import_cost_p
+        total_export_revenue_p += export_revenue_p
+        total_sc_p += sc_p
+
+        daily_rows.append({
+            "date": day,
+            "total_import_kwh": round(total_import, 4),
+            "extra_kwh": round(extra_kwh, 4),
+            "export_kwh": round(export_kwh, 4),
+            "import_cost_p": round(import_cost_p, 4),
+            "export_revenue_p": round(export_revenue_p, 4),
+            "standing_charge_p": round(sc_p, 4),
+            "net_cost_p": round(import_cost_p + sc_p - export_revenue_p, 4),
+        })
+
+    summary = {
+        "tariff": "flexible",
+        "import_cost_gbp": round(pence_to_pounds(total_import_cost_p), 2),
+        "export_revenue_gbp": round(pence_to_pounds(total_export_revenue_p), 2),
+        "standing_charge_gbp": round(pence_to_pounds(total_sc_p), 2),
+        "net_cost_gbp": round(pence_to_pounds(total_import_cost_p + total_sc_p - total_export_revenue_p), 2),
+    }
+    return summary, pd.DataFrame(daily_rows)
+
+
+def download_tracker_rates(region_code: str, cache_dir: Path, force: bool = False) -> Optional[pd.DataFrame]:
+    """Download Octopus Tracker daily rates from the Octopus API.
+
+    Returns a DataFrame with columns: date, price_p_per_kwh
+    Returns None if rates cannot be fetched.
+    """
+    region_code = region_code.upper()
+    product_code = "SILVER-24-04-03"  # Current Tracker product code
+    tariff_code = f"E-1R-{product_code}-{region_code}"
+    cache_path = cache_dir / f"tracker_{region_code}.csv"
+
+    if not force and cache_path.exists():
+        df = pd.read_csv(cache_path)
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        return df
+
+    url = f"https://api.octopus.energy/v1/products/{product_code}/electricity-tariffs/{tariff_code}/standard-unit-rates/"
+    all_results = []
+    page_url = url
+
+    try:
+        while page_url:
+            resp = requests.get(page_url, timeout=30, params={"page_size": 1500})
+            resp.raise_for_status()
+            data = resp.json()
+            all_results.extend(data.get("results", []))
+            page_url = data.get("next")
+    except requests.RequestException as e:
+        print(f"  Warning: could not fetch Tracker rates: {e}")
+        # Try fallback product code
+        product_code = "SILVER-FLEX-22-11-25"
+        tariff_code = f"E-1R-{product_code}-{region_code}"
+        url = f"https://api.octopus.energy/v1/products/{product_code}/electricity-tariffs/{tariff_code}/standard-unit-rates/"
+        page_url = url
+        all_results = []
+        try:
+            while page_url:
+                resp = requests.get(page_url, timeout=30, params={"page_size": 1500})
+                resp.raise_for_status()
+                data = resp.json()
+                all_results.extend(data.get("results", []))
+                page_url = data.get("next")
+        except requests.RequestException as e2:
+            print(f"  Warning: fallback Tracker fetch also failed: {e2}")
+            return None
+
+    if not all_results:
+        print("  Warning: no Tracker rate data returned from API")
+        return None
+
+    df = pd.DataFrame(all_results)
+    df["valid_from"] = pd.to_datetime(df["valid_from"], utc=True)
+    df["date"] = df["valid_from"].dt.tz_convert(LOCAL_TZ).dt.date
+    # Tracker has one rate per day — take the last one per date if duplicates
+    df = df.sort_values("valid_from").drop_duplicates(subset=["date"], keep="last")
+    df = df.rename(columns={"value_inc_vat": "price_p_per_kwh"})
+    df = df[["date", "price_p_per_kwh"]].sort_values("date")
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    df.to_csv(cache_path, index=False)
+    return df
+
+
+def calculate_tracker(hh: pd.DataFrame, tracker_rates: pd.DataFrame, tariff: TrackerTariff, scenario: ScenarioConfig):
+    """Calculate costs on Octopus Tracker tariff (daily variable rate)."""
+    df = hh.copy()
+    df["date"] = df["slot_start"].dt.date
+    df["extra_kwh"] = build_extra_profile(df["slot_start"], scenario.extra_daily_kwh, scenario.extra_start, scenario.extra_end)
+
+    # Merge tracker daily rates
+    tracker_rates = tracker_rates.copy()
+    tracker_rates["date"] = pd.to_datetime(tracker_rates["date"]).dt.date
+    df = df.merge(tracker_rates[["date", "price_p_per_kwh"]], on="date", how="left")
+
+    if df["price_p_per_kwh"].isna().any():
+        missing_days = df[df["price_p_per_kwh"].isna()]["date"].nunique()
+        print(f"  Warning: dropping {missing_days} days with missing Tracker prices")
+        df = df.dropna(subset=["price_p_per_kwh"]).copy()
+
+    daily_rows = []
+    total_import_cost_p = total_export_revenue_p = total_sc_p = 0.0
+
+    for day, group in df.groupby("date", sort=True):
+        total_import = group["total_import_kwh"].sum()
+        export_kwh = group["export_kwh"].sum()
+        extra_kwh = group["extra_kwh"].sum()
+        day_rate = group["price_p_per_kwh"].iloc[0]
+
+        import_cost_p = (total_import + extra_kwh) * day_rate
+        export_revenue_p = export_kwh * tariff.export_p_per_kwh
+        sc_p = tariff.standing_charge_p_per_day
+
+        total_import_cost_p += import_cost_p
+        total_export_revenue_p += export_revenue_p
+        total_sc_p += sc_p
+
+        daily_rows.append({
+            "date": day,
+            "total_import_kwh": round(total_import, 4),
+            "extra_kwh": round(extra_kwh, 4),
+            "export_kwh": round(export_kwh, 4),
+            "tracker_rate_p_per_kwh": round(day_rate, 4),
+            "import_cost_p": round(import_cost_p, 4),
+            "export_revenue_p": round(export_revenue_p, 4),
+            "standing_charge_p": round(sc_p, 4),
+            "net_cost_p": round(import_cost_p + sc_p - export_revenue_p, 4),
+        })
+
+    summary = {
+        "tariff": "tracker",
+        "import_cost_gbp": round(pence_to_pounds(total_import_cost_p), 2),
+        "export_revenue_gbp": round(pence_to_pounds(total_export_revenue_p), 2),
+        "standing_charge_gbp": round(pence_to_pounds(total_sc_p), 2),
+        "net_cost_gbp": round(pence_to_pounds(total_import_cost_p + total_sc_p - total_export_revenue_p), 2),
+    }
+    return summary, pd.DataFrame(daily_rows)
+
+
 def write_csv(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False)
@@ -449,6 +906,19 @@ def print_summary_table(rows):
 
 
 def run_compare(args) -> int:
+    # Determine which tariffs to run
+    tariffs_to_run = getattr(args, "tariffs", None)
+    all_tariffs = {"intelligent", "agile", "go", "flux", "cosy", "flexible", "tracker"}
+    if tariffs_to_run:
+        selected = {t.strip().lower() for t in tariffs_to_run.split(",")}
+        invalid = selected - all_tariffs
+        if invalid:
+            print(f"Error: unknown tariff(s): {', '.join(sorted(invalid))}")
+            print(f"Available: {', '.join(sorted(all_tariffs))}")
+            return 1
+    else:
+        selected = all_tariffs
+
     scenario = ScenarioConfig(
         battery_capacity_kwh=args.battery_capacity_kwh,
         extra_daily_kwh=args.extra_daily_kwh,
@@ -456,38 +926,121 @@ def run_compare(args) -> int:
         extra_end=args.extra_end,
         ev_exclusion_enabled=not args.no_ev_exclusion,
     )
-    intelligent = IntelligentTariff(
-        offpeak_import_p_per_kwh=args.intelligent_offpeak_import,
-        peak_import_p_per_kwh=args.intelligent_peak_import,
-        export_p_per_kwh=args.intelligent_export,
-        standing_charge_p_per_day=args.intelligent_standing_charge,
-        offpeak_start=args.intelligent_offpeak_start,
-        offpeak_end=args.intelligent_offpeak_end,
-    )
-    agile_cfg = AgileConfig(
-        standing_charge_p_per_day=args.agile_standing_charge,
-        flexible_charge_hours_per_day=args.agile_flex_hours,
-        flexible_max_kw=args.agile_flex_max_kw,
-    )
 
     hh = load_power_csv(Path(args.power_csv), scenario)
     hh = trim_date_range(hh, args.start_date, args.end_date)
     if hh.empty:
         raise RuntimeError("No power data left after applying date filter")
 
-    in_path, out_path = download_region_tariffs(args.region_code, Path(args.cache_dir), force=args.refresh_tariffs)
-    agile_in = read_agile_csv(in_path)
-    agile_out = read_agile_csv(out_path)
-
-    intelligent_summary, intelligent_daily = calculate_intelligent(hh, intelligent, scenario)
-    agile_summary, agile_daily = calculate_agile(hh, agile_in, agile_out, agile_cfg, scenario)
-
+    summaries = []
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    summary_df = pd.DataFrame([intelligent_summary, agile_summary]).sort_values("net_cost_gbp")
+
+    # Intelligent
+    if "intelligent" in selected:
+        intelligent = IntelligentTariff(
+            offpeak_import_p_per_kwh=args.intelligent_offpeak_import,
+            peak_import_p_per_kwh=args.intelligent_peak_import,
+            export_p_per_kwh=args.intelligent_export,
+            standing_charge_p_per_day=args.intelligent_standing_charge,
+            offpeak_start=args.intelligent_offpeak_start,
+            offpeak_end=args.intelligent_offpeak_end,
+        )
+        s, daily = calculate_intelligent(hh, intelligent, scenario)
+        summaries.append(s)
+        write_csv(daily, out_dir / "daily_breakdown_intelligent.csv")
+
+    # Agile
+    if "agile" in selected:
+        agile_cfg = AgileConfig(
+            standing_charge_p_per_day=args.agile_standing_charge,
+            flexible_charge_hours_per_day=args.agile_flex_hours,
+            flexible_max_kw=args.agile_flex_max_kw,
+        )
+        in_path, out_path = download_region_tariffs(args.region_code, Path(args.cache_dir), force=args.refresh_tariffs)
+        agile_in = read_agile_csv(in_path)
+        agile_out = read_agile_csv(out_path)
+        s, daily = calculate_agile(hh, agile_in, agile_out, agile_cfg, scenario)
+        summaries.append(s)
+        write_csv(daily, out_dir / "daily_breakdown_agile.csv")
+
+    # Go
+    if "go" in selected:
+        go = GoTariff(
+            offpeak_import_p_per_kwh=getattr(args, "go_offpeak_import", 8.0),
+            peak_import_p_per_kwh=getattr(args, "go_peak_import", 24.5),
+            export_p_per_kwh=getattr(args, "go_export", 12.0),
+            standing_charge_p_per_day=getattr(args, "go_standing_charge", 53.35),
+            offpeak_start=getattr(args, "go_offpeak_start", "23:30"),
+            offpeak_end=getattr(args, "go_offpeak_end", "05:30"),
+        )
+        s, daily = calculate_go(hh, go, scenario)
+        summaries.append(s)
+        write_csv(daily, out_dir / "daily_breakdown_go.csv")
+
+    # Flux
+    if "flux" in selected:
+        flux = FluxTariff(
+            offpeak_import_p_per_kwh=getattr(args, "flux_offpeak_import", 9.80),
+            day_import_p_per_kwh=getattr(args, "flux_day_import", 22.36),
+            peak_import_p_per_kwh=getattr(args, "flux_peak_import", 33.54),
+            offpeak_export_p_per_kwh=getattr(args, "flux_offpeak_export", 4.05),
+            day_export_p_per_kwh=getattr(args, "flux_day_export", 14.40),
+            peak_export_p_per_kwh=getattr(args, "flux_peak_export", 28.60),
+            standing_charge_p_per_day=getattr(args, "flux_standing_charge", 48.93),
+            offpeak_start=getattr(args, "flux_offpeak_start", "02:00"),
+            offpeak_end=getattr(args, "flux_offpeak_end", "05:00"),
+            peak_start=getattr(args, "flux_peak_start", "16:00"),
+            peak_end=getattr(args, "flux_peak_end", "19:00"),
+        )
+        s, daily = calculate_flux(hh, flux, scenario)
+        summaries.append(s)
+        write_csv(daily, out_dir / "daily_breakdown_flux.csv")
+
+    # Cosy
+    if "cosy" in selected:
+        cosy = CosyTariff(
+            cosy_import_p_per_kwh=getattr(args, "cosy_import", 12.0),
+            day_import_p_per_kwh=getattr(args, "cosy_day_import", 24.50),
+            peak_import_p_per_kwh=getattr(args, "cosy_peak_import", 36.75),
+            export_p_per_kwh=getattr(args, "cosy_export", 12.0),
+            standing_charge_p_per_day=getattr(args, "cosy_standing_charge", 53.35),
+        )
+        s, daily = calculate_cosy(hh, cosy, scenario)
+        summaries.append(s)
+        write_csv(daily, out_dir / "daily_breakdown_cosy.csv")
+
+    # Flexible (SVR)
+    if "flexible" in selected:
+        flexible = FlexibleTariff(
+            import_p_per_kwh=getattr(args, "flexible_import", 24.50),
+            export_p_per_kwh=getattr(args, "flexible_export", 12.0),
+            standing_charge_p_per_day=getattr(args, "flexible_standing_charge", 53.35),
+        )
+        s, daily = calculate_flexible(hh, flexible, scenario)
+        summaries.append(s)
+        write_csv(daily, out_dir / "daily_breakdown_flexible.csv")
+
+    # Tracker
+    if "tracker" in selected:
+        tracker_tariff = TrackerTariff(
+            standing_charge_p_per_day=getattr(args, "tracker_standing_charge", 53.35),
+            export_p_per_kwh=getattr(args, "tracker_export", 12.0),
+        )
+        tracker_rates = download_tracker_rates(args.region_code, Path(args.cache_dir), force=args.refresh_tariffs)
+        if tracker_rates is not None and not tracker_rates.empty:
+            s, daily = calculate_tracker(hh, tracker_rates, tracker_tariff, scenario)
+            summaries.append(s)
+            write_csv(daily, out_dir / "daily_breakdown_tracker.csv")
+        else:
+            print("  Skipping Tracker: no rate data available")
+
+    if not summaries:
+        print("No tariffs calculated.")
+        return 1
+
+    summary_df = pd.DataFrame(summaries).sort_values("net_cost_gbp")
     write_csv(summary_df, out_dir / "summary.csv")
-    write_csv(intelligent_daily, out_dir / "daily_breakdown_intelligent.csv")
-    write_csv(agile_daily, out_dir / "daily_breakdown_agile.csv")
 
     rows = summary_df.to_dict(orient="records")
     print_summary_table(rows)
@@ -574,6 +1127,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Re-download Agile tariff CSVs even if cached")
     default.add_argument("--no-ev-exclusion", action="store_true",
         help="Disable automatic EV charging detection and exclusion")
+    default.add_argument("--tariffs",
+        help="Comma-separated list of tariffs to compare (default: all). "
+             "Options: intelligent,agile,go,flux,cosy,flexible,tracker")
     default.set_defaults(
         intelligent_offpeak_import=d("intelligent_offpeak_import", 7.0),
         intelligent_peak_import=d("intelligent_peak_import", 26.0),
@@ -586,6 +1142,33 @@ def build_parser() -> argparse.ArgumentParser:
         agile_flex_max_kw=d("agile_flex_max_kw", 3.3),
         extra_start=d("extra_start", "17:00"),
         extra_end=d("extra_end", "22:00"),
+        go_offpeak_import=d("go_offpeak_import", 8.0),
+        go_peak_import=d("go_peak_import", 24.5),
+        go_export=d("go_export", 12.0),
+        go_standing_charge=d("go_standing_charge", 53.35),
+        go_offpeak_start=d("go_offpeak_start", "23:30"),
+        go_offpeak_end=d("go_offpeak_end", "05:30"),
+        flux_offpeak_import=d("flux_offpeak_import", 9.80),
+        flux_day_import=d("flux_day_import", 22.36),
+        flux_peak_import=d("flux_peak_import", 33.54),
+        flux_offpeak_export=d("flux_offpeak_export", 4.05),
+        flux_day_export=d("flux_day_export", 14.40),
+        flux_peak_export=d("flux_peak_export", 28.60),
+        flux_standing_charge=d("flux_standing_charge", 48.93),
+        flux_offpeak_start=d("flux_offpeak_start", "02:00"),
+        flux_offpeak_end=d("flux_offpeak_end", "05:00"),
+        flux_peak_start=d("flux_peak_start", "16:00"),
+        flux_peak_end=d("flux_peak_end", "19:00"),
+        cosy_import=d("cosy_import", 12.0),
+        cosy_day_import=d("cosy_day_import", 24.50),
+        cosy_peak_import=d("cosy_peak_import", 36.75),
+        cosy_export=d("cosy_export", 12.0),
+        cosy_standing_charge=d("cosy_standing_charge", 53.35),
+        flexible_import=d("flexible_import", 24.50),
+        flexible_export=d("flexible_export", 12.0),
+        flexible_standing_charge=d("flexible_standing_charge", 53.35),
+        tracker_standing_charge=d("tracker_standing_charge", 53.35),
+        tracker_export=d("tracker_export", 12.0),
     )
 
     # ── compare ───────────────────────────────────────────────────
@@ -634,6 +1217,68 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max charge rate during flexible Agile slots in kW (default: %(default)s)")
     compare.add_argument("--no-ev-exclusion", action="store_true",
         help="Disable automatic EV charging detection and exclusion")
+    compare.add_argument("--tariffs",
+        help="Comma-separated list of tariffs to compare (default: all). "
+             "Options: intelligent,agile,go,flux,cosy,flexible,tracker")
+    # Go tariff arguments
+    compare.add_argument("--go-offpeak-import", type=float, default=d("go_offpeak_import", 8.0),
+        help="Go off-peak import rate in p/kWh (default: %(default)s)")
+    compare.add_argument("--go-peak-import", type=float, default=d("go_peak_import", 24.5),
+        help="Go peak import rate in p/kWh (default: %(default)s)")
+    compare.add_argument("--go-export", type=float, default=d("go_export", 12.0),
+        help="Go export rate in p/kWh (default: %(default)s)")
+    compare.add_argument("--go-standing-charge", type=float, default=d("go_standing_charge", 53.35),
+        help="Go daily standing charge in p/day (default: %(default)s)")
+    compare.add_argument("--go-offpeak-start", default=d("go_offpeak_start", "23:30"),
+        help="Go off-peak window start HH:MM (default: %(default)s)")
+    compare.add_argument("--go-offpeak-end", default=d("go_offpeak_end", "05:30"),
+        help="Go off-peak window end HH:MM (default: %(default)s)")
+    # Flux tariff arguments
+    compare.add_argument("--flux-offpeak-import", type=float, default=d("flux_offpeak_import", 9.80),
+        help="Flux off-peak import rate in p/kWh (default: %(default)s)")
+    compare.add_argument("--flux-day-import", type=float, default=d("flux_day_import", 22.36),
+        help="Flux day import rate in p/kWh (default: %(default)s)")
+    compare.add_argument("--flux-peak-import", type=float, default=d("flux_peak_import", 33.54),
+        help="Flux peak import rate in p/kWh (default: %(default)s)")
+    compare.add_argument("--flux-offpeak-export", type=float, default=d("flux_offpeak_export", 4.05),
+        help="Flux off-peak export rate in p/kWh (default: %(default)s)")
+    compare.add_argument("--flux-day-export", type=float, default=d("flux_day_export", 14.40),
+        help="Flux day export rate in p/kWh (default: %(default)s)")
+    compare.add_argument("--flux-peak-export", type=float, default=d("flux_peak_export", 28.60),
+        help="Flux peak export rate in p/kWh (default: %(default)s)")
+    compare.add_argument("--flux-standing-charge", type=float, default=d("flux_standing_charge", 48.93),
+        help="Flux daily standing charge in p/day (default: %(default)s)")
+    compare.add_argument("--flux-offpeak-start", default=d("flux_offpeak_start", "02:00"),
+        help="Flux off-peak window start HH:MM (default: %(default)s)")
+    compare.add_argument("--flux-offpeak-end", default=d("flux_offpeak_end", "05:00"),
+        help="Flux off-peak window end HH:MM (default: %(default)s)")
+    compare.add_argument("--flux-peak-start", default=d("flux_peak_start", "16:00"),
+        help="Flux peak window start HH:MM (default: %(default)s)")
+    compare.add_argument("--flux-peak-end", default=d("flux_peak_end", "19:00"),
+        help="Flux peak window end HH:MM (default: %(default)s)")
+    # Cosy tariff arguments
+    compare.add_argument("--cosy-import", type=float, default=d("cosy_import", 12.0),
+        help="Cosy cheap window import rate in p/kWh (default: %(default)s)")
+    compare.add_argument("--cosy-day-import", type=float, default=d("cosy_day_import", 24.50),
+        help="Cosy standard day import rate in p/kWh (default: %(default)s)")
+    compare.add_argument("--cosy-peak-import", type=float, default=d("cosy_peak_import", 36.75),
+        help="Cosy peak import rate in p/kWh (default: %(default)s)")
+    compare.add_argument("--cosy-export", type=float, default=d("cosy_export", 12.0),
+        help="Cosy export rate in p/kWh (default: %(default)s)")
+    compare.add_argument("--cosy-standing-charge", type=float, default=d("cosy_standing_charge", 53.35),
+        help="Cosy daily standing charge in p/day (default: %(default)s)")
+    # Flexible (SVR) tariff arguments
+    compare.add_argument("--flexible-import", type=float, default=d("flexible_import", 24.50),
+        help="Flexible (SVR) flat import rate in p/kWh (default: %(default)s)")
+    compare.add_argument("--flexible-export", type=float, default=d("flexible_export", 12.0),
+        help="Flexible export rate in p/kWh (default: %(default)s)")
+    compare.add_argument("--flexible-standing-charge", type=float, default=d("flexible_standing_charge", 53.35),
+        help="Flexible daily standing charge in p/day (default: %(default)s)")
+    # Tracker tariff arguments
+    compare.add_argument("--tracker-standing-charge", type=float, default=d("tracker_standing_charge", 53.35),
+        help="Tracker daily standing charge in p/day (default: %(default)s)")
+    compare.add_argument("--tracker-export", type=float, default=d("tracker_export", 12.0),
+        help="Tracker export rate in p/kWh (default: %(default)s)")
 
     # ── download-data ─────────────────────────────────────────────
     download = sub.add_parser("download-data",
@@ -688,7 +1333,35 @@ def build_parser() -> argparse.ArgumentParser:
         agile_standing_charge=d("agile_standing_charge", 66.26),
         agile_flex_hours=d("agile_flex_hours", 6.0),
         agile_flex_max_kw=d("agile_flex_max_kw", 3.3),
+        go_offpeak_import=d("go_offpeak_import", 8.0),
+        go_peak_import=d("go_peak_import", 24.5),
+        go_export=d("go_export", 12.0),
+        go_standing_charge=d("go_standing_charge", 53.35),
+        go_offpeak_start=d("go_offpeak_start", "23:30"),
+        go_offpeak_end=d("go_offpeak_end", "05:30"),
+        flux_offpeak_import=d("flux_offpeak_import", 9.80),
+        flux_day_import=d("flux_day_import", 22.36),
+        flux_peak_import=d("flux_peak_import", 33.54),
+        flux_offpeak_export=d("flux_offpeak_export", 4.05),
+        flux_day_export=d("flux_day_export", 14.40),
+        flux_peak_export=d("flux_peak_export", 28.60),
+        flux_standing_charge=d("flux_standing_charge", 48.93),
+        flux_offpeak_start=d("flux_offpeak_start", "02:00"),
+        flux_offpeak_end=d("flux_offpeak_end", "05:00"),
+        flux_peak_start=d("flux_peak_start", "16:00"),
+        flux_peak_end=d("flux_peak_end", "19:00"),
+        cosy_import=d("cosy_import", 12.0),
+        cosy_day_import=d("cosy_day_import", 24.50),
+        cosy_peak_import=d("cosy_peak_import", 36.75),
+        cosy_export=d("cosy_export", 12.0),
+        cosy_standing_charge=d("cosy_standing_charge", 53.35),
+        flexible_import=d("flexible_import", 24.50),
+        flexible_export=d("flexible_export", 12.0),
+        flexible_standing_charge=d("flexible_standing_charge", 53.35),
+        tracker_standing_charge=d("tracker_standing_charge", 53.35),
+        tracker_export=d("tracker_export", 12.0),
         start_date=None, end_date=None, refresh_tariffs=True,
+        tariffs=None,
     )
 
     # ── model ─────────────────────────────────────────────────────
@@ -747,7 +1420,35 @@ during a specified time window.""",
         agile_standing_charge=d("agile_standing_charge", 66.26),
         agile_flex_hours=d("agile_flex_hours", 6.0),
         agile_flex_max_kw=d("agile_flex_max_kw", 3.3),
+        go_offpeak_import=d("go_offpeak_import", 8.0),
+        go_peak_import=d("go_peak_import", 24.5),
+        go_export=d("go_export", 12.0),
+        go_standing_charge=d("go_standing_charge", 53.35),
+        go_offpeak_start=d("go_offpeak_start", "23:30"),
+        go_offpeak_end=d("go_offpeak_end", "05:30"),
+        flux_offpeak_import=d("flux_offpeak_import", 9.80),
+        flux_day_import=d("flux_day_import", 22.36),
+        flux_peak_import=d("flux_peak_import", 33.54),
+        flux_offpeak_export=d("flux_offpeak_export", 4.05),
+        flux_day_export=d("flux_day_export", 14.40),
+        flux_peak_export=d("flux_peak_export", 28.60),
+        flux_standing_charge=d("flux_standing_charge", 48.93),
+        flux_offpeak_start=d("flux_offpeak_start", "02:00"),
+        flux_offpeak_end=d("flux_offpeak_end", "05:00"),
+        flux_peak_start=d("flux_peak_start", "16:00"),
+        flux_peak_end=d("flux_peak_end", "19:00"),
+        cosy_import=d("cosy_import", 12.0),
+        cosy_day_import=d("cosy_day_import", 24.50),
+        cosy_peak_import=d("cosy_peak_import", 36.75),
+        cosy_export=d("cosy_export", 12.0),
+        cosy_standing_charge=d("cosy_standing_charge", 53.35),
+        flexible_import=d("flexible_import", 24.50),
+        flexible_export=d("flexible_export", 12.0),
+        flexible_standing_charge=d("flexible_standing_charge", 53.35),
+        tracker_standing_charge=d("tracker_standing_charge", 53.35),
+        tracker_export=d("tracker_export", 12.0),
         start_date=None, end_date=None, refresh_tariffs=False,
+        tariffs=None,
     )
 
     return parser
