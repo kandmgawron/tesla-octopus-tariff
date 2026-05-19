@@ -29,16 +29,21 @@ This downloads a full year of 5-minute power data from Tesla. It will prompt you
 python octopus_powerwall_tariff_compare.py download-data
 ```
 
-Data is saved to `download/<site_id>/power.csv`. Per-day files are cached in `download/<site_id>/power/` so subsequent runs only download new days.
+Data is saved to `download/power.csv`. Per-day files are cached in `download/power/` so subsequent runs only download new days.
 
 ### 3. Run the tariff comparison
 
 ```bash
-python octopus_powerwall_tariff_compare.py default \
-  --power-csv download/<site_id>/power.csv
+python octopus_powerwall_tariff_compare.py default
 ```
 
-Replace `<site_id>` with your Tesla energy site ID (printed during download).
+This automatically refreshes your Powerwall data (downloads any new days), then runs the comparison. If no data exists yet, it downloads everything and tells you how long it will take (~10 minutes per year).
+
+You can also skip the auto-download and just compare existing data:
+
+```bash
+python octopus_powerwall_tariff_compare.py compare --power-csv download/power.csv
+```
 
 ### All-in-one: download + refresh tariffs + compare
 
@@ -68,18 +73,18 @@ Model how changes to your energy usage would affect costs:
 ```bash
 # What if I buy an EV that charges 7.5 kWh/day overnight?
 python octopus_powerwall_tariff_compare.py model \
-  --power-csv download/<site_id>/power.csv \
+  --power-csv download/power.csv \
   --label "New EV" --adjust-kwh 7.5 --window 00:30-05:30
 
 # What about an EV AND a hot tub (5 kWh/day evenings)?
 python octopus_powerwall_tariff_compare.py model \
-  --power-csv download/<site_id>/power.csv \
+  --power-csv download/power.csv \
   --label "EV" --adjust-kwh 7.5 --window 00:30-05:30 \
   --label "Hot tub" --adjust-kwh 5 --window 17:00-22:00
 
 # Model reduced usage (e.g. better insulation saving 3 kWh/day)
 python octopus_powerwall_tariff_compare.py model \
-  --power-csv download/<site_id>/power.csv \
+  --power-csv download/power.csv \
   --label "Insulation" --adjust-kwh -3 --window 06:00-22:00
 ```
 
