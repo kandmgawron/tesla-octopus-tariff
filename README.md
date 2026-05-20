@@ -10,7 +10,8 @@ Unlike simple rate calculators, this tool runs a **full battery optimisation sim
 - **Battery charging**: Charges from grid during the cheapest import slots each day.
 - **Battery discharging**: Discharges to avoid expensive grid imports, or exports to grid when export rates are high.
 - **Efficiency losses**: Accounts for 90% round-trip battery efficiency (configurable).
-- **Physical limits**: Respects battery capacity and max charge/discharge rates.
+- **Physical limits**: Respects battery capacity, max charge/discharge rates, and 10% reserve floor.
+- **Realistic state**: Battery state of charge carries across days — no artificial daily reset. If the battery is depleted one evening, it stays low until the next cheap charging window.
 
 ## Supported Tariffs
 
