@@ -288,6 +288,18 @@ def load_power_csv(path: Path, scenario: ScenarioConfig) -> pd.DataFrame:
     df["import_kwh_5m"] = np.where(df["grid_power"] > 0, df["grid_power"] / 12.0 / 1000.0, 0.0)
     df["export_kwh_5m"] = np.where(df["grid_power"] < 0, -df["grid_power"] / 12.0 / 1000.0, 0.0)
 
+    # Track battery charging from grid: battery_power < 0 means charging
+    # The portion from grid is min(|battery_power|, grid_power) when both conditions hold
+    if "battery_power" in df.columns:
+        df["battery_power"] = pd.to_numeric(df["battery_power"], errors="coerce").fillna(0.0)
+        df["battery_charge_from_grid_kwh_5m"] = np.where(
+            (df["battery_power"] < 0) & (df["grid_power"] > 0),
+            np.minimum(np.abs(df["battery_power"]), df["grid_power"]) / 12.0 / 1000.0,
+            0.0,
+        )
+    else:
+        df["battery_charge_from_grid_kwh_5m"] = 0.0
+
     if scenario.ev_exclusion_enabled:
         df["is_car_charging"] = df.apply(
             lambda row: (
@@ -311,6 +323,7 @@ def load_power_csv(path: Path, scenario: ScenarioConfig) -> pd.DataFrame:
             non_car_import_kwh=("non_car_import_kwh_5m", "sum"),
             car_import_kwh=("car_import_kwh_5m", "sum"),
             export_kwh=("export_kwh_5m", "sum"),
+            battery_charge_from_grid_kwh=("battery_charge_from_grid_kwh_5m", "sum"),
         )
         .sort_values("slot_start")
     )
@@ -891,6 +904,166 @@ def calculate_tracker(hh: pd.DataFrame, tracker_rates: pd.DataFrame, tariff: Tra
     return summary, pd.DataFrame(daily_rows)
 
 
+# ── Optimised Battery Charging ────────────────────────────────────────────────
+
+
+def _get_slot_rate_for_tariff(slot_start: pd.Timestamp, tariff_name: str, tariff_config, agile_rates=None, tracker_rates=None):
+    """Get the import rate for a given slot based on tariff type."""
+    if tariff_name == "intelligent":
+        if time_in_window(slot_start, tariff_config.offpeak_start, tariff_config.offpeak_end):
+            return tariff_config.offpeak_import_p_per_kwh
+        return tariff_config.peak_import_p_per_kwh
+    if tariff_name == "go":
+        if time_in_window(slot_start, tariff_config.offpeak_start, tariff_config.offpeak_end):
+            return tariff_config.offpeak_import_p_per_kwh
+        return tariff_config.peak_import_p_per_kwh
+    if tariff_name == "flux":
+        band = _flux_band(slot_start, tariff_config)
+        rates = {
+            "offpeak": tariff_config.offpeak_import_p_per_kwh,
+            "day": tariff_config.day_import_p_per_kwh,
+            "peak": tariff_config.peak_import_p_per_kwh,
+        }
+        return rates[band]
+    if tariff_name == "cosy":
+        band = _cosy_band(slot_start, tariff_config)
+        rates = {
+            "cosy": tariff_config.cosy_import_p_per_kwh,
+            "day": tariff_config.day_import_p_per_kwh,
+            "peak": tariff_config.peak_import_p_per_kwh,
+        }
+        return rates[band]
+    if tariff_name == "flexible":
+        return tariff_config.import_p_per_kwh
+    if tariff_name == "agile" and agile_rates is not None:
+        match = agile_rates[agile_rates["slot_start"] == slot_start]
+        if not match.empty:
+            return float(match.iloc[0]["price_p_per_kwh"])
+        return None
+    if tariff_name == "tracker" and tracker_rates is not None:
+        day = slot_start.date()
+        match = tracker_rates[tracker_rates["date"] == day]
+        if not match.empty:
+            return float(match.iloc[0]["price_p_per_kwh"])
+        return None
+    return None
+
+
+def calculate_optimised_charging(
+    hh: pd.DataFrame,
+    tariff_name: str,
+    tariff_config,
+    scenario: ScenarioConfig,
+    agile_rates=None,
+    tracker_rates=None,
+    battery_max_charge_kw: float = 5.0,
+):
+    """Calculate savings from moving battery charging to cheapest slots.
+
+    For each day:
+    1. Identify how much the battery charged from the grid (and at what cost)
+    2. Remove that charging from its original slots
+    3. Re-allocate it to the cheapest available slots (respecting max charge rate)
+    4. Report actual cost vs optimised cost and the saving
+
+    Args:
+        hh: Half-hourly power data with battery_charge_from_grid_kwh column
+        tariff_name: Name of the tariff being analysed
+        tariff_config: Tariff configuration dataclass
+        scenario: Scenario configuration
+        agile_rates: Agile import rates DataFrame (for agile tariff)
+        tracker_rates: Tracker daily rates DataFrame (for tracker tariff)
+        battery_max_charge_kw: Maximum battery charge rate in kW (default 5.0 for Powerwall 2)
+    """
+    df = hh.copy()
+    df["date"] = df["slot_start"].dt.date
+
+    # Get the import rate for each slot
+    df["import_rate_p"] = df["slot_start"].apply(
+        lambda ts: _get_slot_rate_for_tariff(ts, tariff_name, tariff_config, agile_rates, tracker_rates)
+    )
+
+    # Drop slots with no rate data (e.g. missing agile/tracker prices)
+    df = df.dropna(subset=["import_rate_p"]).copy()
+
+    if df.empty:
+        return None, None
+
+    slot_max_kwh = battery_max_charge_kw * 0.5  # max kWh per 30-min slot
+
+    daily_rows = []
+    total_actual_cost_p = 0.0
+    total_optimised_cost_p = 0.0
+    total_battery_kwh = 0.0
+
+    for day, group in df.groupby("date", sort=True):
+        group = group.copy().sort_values("slot_start")
+        daily_battery_kwh = group["battery_charge_from_grid_kwh"].sum()
+
+        if daily_battery_kwh < 0.01:
+            # No meaningful battery charging this day
+            daily_rows.append({
+                "date": day,
+                "battery_charge_kwh": 0.0,
+                "actual_cost_p": 0.0,
+                "optimised_cost_p": 0.0,
+                "saving_p": 0.0,
+                "cheapest_window": "",
+            })
+            continue
+
+        # Actual cost: what was paid for battery charging in original slots
+        actual_cost_p = float((group["battery_charge_from_grid_kwh"] * group["import_rate_p"]).sum())
+
+        # Optimised: allocate the same kWh to cheapest slots
+        sorted_by_price = group.sort_values("import_rate_p")
+        remaining_kwh = daily_battery_kwh
+        optimised_cost_p = 0.0
+        cheapest_slots = []
+
+        for _, row in sorted_by_price.iterrows():
+            if remaining_kwh <= 1e-9:
+                break
+            allocate = min(slot_max_kwh, remaining_kwh)
+            optimised_cost_p += allocate * row["import_rate_p"]
+            remaining_kwh -= allocate
+            cheapest_slots.append(row["slot_start"].strftime("%H:%M"))
+
+        saving_p = actual_cost_p - optimised_cost_p
+
+        total_actual_cost_p += actual_cost_p
+        total_optimised_cost_p += optimised_cost_p
+        total_battery_kwh += daily_battery_kwh
+
+        # Show the time window used for optimised charging
+        if cheapest_slots:
+            window_start = cheapest_slots[0]
+            window_end = cheapest_slots[-1]
+            cheapest_window = f"{window_start}-{window_end}" if window_start != window_end else window_start
+        else:
+            cheapest_window = ""
+
+        daily_rows.append({
+            "date": day,
+            "battery_charge_kwh": round(daily_battery_kwh, 4),
+            "actual_cost_p": round(actual_cost_p, 4),
+            "optimised_cost_p": round(optimised_cost_p, 4),
+            "saving_p": round(saving_p, 4),
+            "cheapest_window": cheapest_window,
+        })
+
+    total_saving_p = total_actual_cost_p - total_optimised_cost_p
+    summary = {
+        "tariff": tariff_name,
+        "total_battery_charge_kwh": round(total_battery_kwh, 2),
+        "actual_charging_cost_gbp": round(pence_to_pounds(total_actual_cost_p), 2),
+        "optimised_charging_cost_gbp": round(pence_to_pounds(total_optimised_cost_p), 2),
+        "saving_gbp": round(pence_to_pounds(total_saving_p), 2),
+        "saving_pct": round(total_saving_p / total_actual_cost_p * 100, 1) if total_actual_cost_p > 0 else 0.0,
+    }
+    return summary, pd.DataFrame(daily_rows)
+
+
 def write_csv(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False)
@@ -1451,6 +1624,96 @@ during a specified time window.""",
         tariffs=None,
     )
 
+    # ── optimise-charging ─────────────────────────────────────────
+    opt = sub.add_parser("optimise-charging",
+        help="Show savings from moving battery charging to cheapest slots",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="""Analyse your actual battery charging patterns and calculate how much
+you could save by shifting charging to the cheapest time slots on each tariff.
+
+This looks at when your Powerwall actually charged from the grid, then simulates
+moving that same energy to the cheapest available half-hour slots each day.
+
+For time-of-use tariffs (Intelligent, Go, Flux, Cosy), this shows the benefit
+of ensuring all charging happens in off-peak windows.
+
+For variable tariffs (Agile, Tracker), this shows the benefit of smart scheduling
+to hit the cheapest half-hours each day.""",
+        epilog="""examples:
+  # See savings across all tariffs
+  %(prog)s optimise-charging --power-csv download/power.csv
+
+  # Just check Agile and Tracker
+  %(prog)s optimise-charging --power-csv download/power.csv --tariffs agile,tracker
+
+  # With a higher charge rate (e.g. Powerwall 3 at 11.5 kW)
+  %(prog)s optimise-charging --power-csv download/power.csv --battery-max-charge-kw 11.5
+""")
+    opt.add_argument("--power-csv", default="download/power.csv",
+        help="Path to Powerwall power CSV (default: %(default)s)")
+    opt.add_argument("--out-dir", default=d("out_dir", "output"),
+        help="Directory for output CSVs (default: %(default)s)")
+    opt.add_argument("--cache-dir", default=d("cache_dir", ".cache/tariffs"),
+        help="Directory for cached tariff CSVs (default: %(default)s)")
+    opt.add_argument("--region-code", default=d("region_code", "M"),
+        help="Octopus region code (default: %(default)s)")
+    opt.add_argument("--start-date",
+        help="Only include data from this date onwards (YYYY-MM-DD)")
+    opt.add_argument("--end-date",
+        help="Only include data up to this date (YYYY-MM-DD)")
+    opt.add_argument("--battery-capacity-kwh", type=float, default=d("battery_capacity_kwh", 13.0),
+        help="Powerwall usable capacity in kWh (default: %(default)s)")
+    opt.add_argument("--battery-max-charge-kw", type=float, default=5.0,
+        help="Maximum battery charge rate in kW (default: %(default)s, Powerwall 2)")
+    opt.add_argument("--refresh-tariffs", action="store_true",
+        help="Re-download tariff data even if cached")
+    opt.add_argument("--no-ev-exclusion", action="store_true",
+        help="Disable automatic EV charging detection and exclusion")
+    opt.add_argument("--tariffs",
+        help="Comma-separated list of tariffs to analyse (default: all). "
+             "Options: intelligent,agile,go,flux,cosy,flexible,tracker")
+    opt.set_defaults(
+        extra_daily_kwh=d("extra_daily_kwh", 0.0),
+        extra_start=d("extra_start", "17:00"),
+        extra_end=d("extra_end", "22:00"),
+        intelligent_offpeak_import=d("intelligent_offpeak_import", 7.0),
+        intelligent_peak_import=d("intelligent_peak_import", 26.0),
+        intelligent_export=d("intelligent_export", 15.0),
+        intelligent_standing_charge=d("intelligent_standing_charge", 57.01),
+        intelligent_offpeak_start=d("intelligent_offpeak_start", "23:30"),
+        intelligent_offpeak_end=d("intelligent_offpeak_end", "05:30"),
+        agile_standing_charge=d("agile_standing_charge", 66.26),
+        agile_flex_hours=d("agile_flex_hours", 6.0),
+        agile_flex_max_kw=d("agile_flex_max_kw", 3.3),
+        go_offpeak_import=d("go_offpeak_import", 8.0),
+        go_peak_import=d("go_peak_import", 24.5),
+        go_export=d("go_export", 12.0),
+        go_standing_charge=d("go_standing_charge", 53.35),
+        go_offpeak_start=d("go_offpeak_start", "23:30"),
+        go_offpeak_end=d("go_offpeak_end", "05:30"),
+        flux_offpeak_import=d("flux_offpeak_import", 9.80),
+        flux_day_import=d("flux_day_import", 22.36),
+        flux_peak_import=d("flux_peak_import", 33.54),
+        flux_offpeak_export=d("flux_offpeak_export", 4.05),
+        flux_day_export=d("flux_day_export", 14.40),
+        flux_peak_export=d("flux_peak_export", 28.60),
+        flux_standing_charge=d("flux_standing_charge", 48.93),
+        flux_offpeak_start=d("flux_offpeak_start", "02:00"),
+        flux_offpeak_end=d("flux_offpeak_end", "05:00"),
+        flux_peak_start=d("flux_peak_start", "16:00"),
+        flux_peak_end=d("flux_peak_end", "19:00"),
+        cosy_import=d("cosy_import", 12.0),
+        cosy_day_import=d("cosy_day_import", 24.50),
+        cosy_peak_import=d("cosy_peak_import", 36.75),
+        cosy_export=d("cosy_export", 12.0),
+        cosy_standing_charge=d("cosy_standing_charge", 53.35),
+        flexible_import=d("flexible_import", 24.50),
+        flexible_export=d("flexible_export", 12.0),
+        flexible_standing_charge=d("flexible_standing_charge", 53.35),
+        tracker_standing_charge=d("tracker_standing_charge", 53.35),
+        tracker_export=d("tracker_export", 12.0),
+    )
+
     return parser
 
 
@@ -1502,6 +1765,8 @@ def main(argv=None) -> int:
         in_path, out_path = download_region_tariffs(args.region_code, Path(args.cache_dir), force=True)
         print(f"Downloaded:\n- {in_path}\n- {out_path}")
         return 0
+    if args.command == "optimise-charging":
+        return run_optimise_charging(args)
     return 0
 
 
@@ -1684,6 +1949,143 @@ def run_model(args) -> int:
 
     # Restore out_dir
     args.out_dir = str(out_dir)
+    return 0
+
+
+def run_optimise_charging(args) -> int:
+    """Analyse battery charging patterns and show savings from optimal scheduling."""
+    scenario = ScenarioConfig(
+        battery_capacity_kwh=args.battery_capacity_kwh,
+        extra_daily_kwh=getattr(args, "extra_daily_kwh", 0.0),
+        extra_start=getattr(args, "extra_start", "17:00"),
+        extra_end=getattr(args, "extra_end", "22:00"),
+        ev_exclusion_enabled=not args.no_ev_exclusion,
+    )
+
+    power_csv = Path(args.power_csv)
+    if not power_csv.exists():
+        print(f"Error: {args.power_csv} not found.")
+        return 1
+
+    hh = load_power_csv(power_csv, scenario)
+    hh = trim_date_range(hh, args.start_date, args.end_date)
+    if hh.empty:
+        raise RuntimeError("No power data left after applying date filter")
+
+    total_battery_kwh = hh["battery_charge_from_grid_kwh"].sum()
+    if total_battery_kwh < 0.1:
+        print("No significant battery charging from grid detected in this data.")
+        print("This could mean:")
+        print("  - Your battery charges primarily from solar")
+        print("  - The power CSV doesn't include battery_power column")
+        return 0
+
+    num_days = hh["date"].nunique()
+    print(f"Battery charging analysis: {total_battery_kwh:.1f} kWh from grid over {num_days} days")
+    print(f"Average: {total_battery_kwh / num_days:.1f} kWh/day")
+    print(f"Max charge rate assumed: {args.battery_max_charge_kw} kW")
+    print()
+
+    # Determine which tariffs to analyse
+    tariffs_to_run = getattr(args, "tariffs", None)
+    all_tariffs = {"intelligent", "agile", "go", "flux", "cosy", "flexible", "tracker"}
+    if tariffs_to_run:
+        selected = {t.strip().lower() for t in tariffs_to_run.split(",")}
+        invalid = selected - all_tariffs
+        if invalid:
+            print(f"Error: unknown tariff(s): {', '.join(sorted(invalid))}")
+            return 1
+    else:
+        selected = all_tariffs
+
+    # Build tariff configs
+    tariff_configs = {}
+    if "intelligent" in selected:
+        tariff_configs["intelligent"] = IntelligentTariff(
+            offpeak_import_p_per_kwh=args.intelligent_offpeak_import,
+            peak_import_p_per_kwh=args.intelligent_peak_import,
+            offpeak_start=args.intelligent_offpeak_start,
+            offpeak_end=args.intelligent_offpeak_end,
+        )
+    if "go" in selected:
+        tariff_configs["go"] = GoTariff(
+            offpeak_import_p_per_kwh=getattr(args, "go_offpeak_import", 8.0),
+            peak_import_p_per_kwh=getattr(args, "go_peak_import", 24.5),
+            offpeak_start=getattr(args, "go_offpeak_start", "23:30"),
+            offpeak_end=getattr(args, "go_offpeak_end", "05:30"),
+        )
+    if "flux" in selected:
+        tariff_configs["flux"] = FluxTariff(
+            offpeak_import_p_per_kwh=getattr(args, "flux_offpeak_import", 9.80),
+            day_import_p_per_kwh=getattr(args, "flux_day_import", 22.36),
+            peak_import_p_per_kwh=getattr(args, "flux_peak_import", 33.54),
+            offpeak_start=getattr(args, "flux_offpeak_start", "02:00"),
+            offpeak_end=getattr(args, "flux_offpeak_end", "05:00"),
+            peak_start=getattr(args, "flux_peak_start", "16:00"),
+            peak_end=getattr(args, "flux_peak_end", "19:00"),
+        )
+    if "cosy" in selected:
+        tariff_configs["cosy"] = CosyTariff(
+            cosy_import_p_per_kwh=getattr(args, "cosy_import", 12.0),
+            day_import_p_per_kwh=getattr(args, "cosy_day_import", 24.50),
+            peak_import_p_per_kwh=getattr(args, "cosy_peak_import", 36.75),
+        )
+    if "flexible" in selected:
+        tariff_configs["flexible"] = FlexibleTariff(
+            import_p_per_kwh=getattr(args, "flexible_import", 24.50),
+        )
+
+    # Fetch variable rate data if needed
+    agile_rates = None
+    tracker_rates = None
+    if "agile" in selected:
+        try:
+            in_path, _ = download_region_tariffs(args.region_code, Path(args.cache_dir), force=args.refresh_tariffs)
+            agile_rates = read_agile_csv(in_path)
+            tariff_configs["agile"] = AgileConfig()  # placeholder — rates come from agile_rates
+        except (FileNotFoundError, requests.RequestException) as e:
+            print(f"  Warning: could not fetch Agile rates: {e}")
+    if "tracker" in selected:
+        tracker_rates = download_tracker_rates(args.region_code, Path(args.cache_dir), force=args.refresh_tariffs)
+        if tracker_rates is not None and not tracker_rates.empty:
+            tariff_configs["tracker"] = TrackerTariff()  # placeholder — rates come from tracker_rates
+        else:
+            print("  Warning: could not fetch Tracker rates, skipping")
+
+    # Run optimisation for each tariff
+    summaries = []
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for tariff_name, tariff_cfg in tariff_configs.items():
+        s, daily = calculate_optimised_charging(
+            hh, tariff_name, tariff_cfg, scenario,
+            agile_rates=agile_rates,
+            tracker_rates=tracker_rates,
+            battery_max_charge_kw=args.battery_max_charge_kw,
+        )
+        if s is not None:
+            summaries.append(s)
+            write_csv(daily, out_dir / f"optimised_charging_{tariff_name}.csv")
+
+    if not summaries:
+        print("No tariff data available for optimisation analysis.")
+        return 1
+
+    # Print results
+    summary_df = pd.DataFrame(summaries).sort_values("saving_gbp", ascending=False)
+    write_csv(summary_df, out_dir / "optimised_charging_summary.csv")
+
+    headers = ["tariff", "total_battery_charge_kwh", "actual_charging_cost_gbp", "optimised_charging_cost_gbp", "saving_gbp", "saving_pct"]
+    widths = {h: max(len(h), max(len(str(r.get(h, ""))) for r in summaries)) for h in headers}
+    print("  ".join(h.ljust(widths[h]) for h in headers))
+    print("  ".join("-" * widths[h] for h in headers))
+    for row in summary_df.to_dict(orient="records"):
+        print("  ".join(str(row.get(h, "")).ljust(widths[h]) for h in headers))
+
+    best = summary_df.iloc[0]
+    print(f"\nBiggest saving: {best['tariff']} — £{best['saving_gbp']:.2f} ({best['saving_pct']:.1f}%)")
+    print(f"Outputs written to: {out_dir}")
     return 0
 
 
