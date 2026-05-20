@@ -42,6 +42,7 @@ SAVEABLE_DEFAULTS = {
     "cosy_export", "cosy_standing_charge",
     "flexible_import", "flexible_export", "flexible_standing_charge",
     "tracker_standing_charge", "tracker_export",
+    "solaredge_api_key", "solaredge_site_id",
 }
 
 
@@ -1234,6 +1235,123 @@ def run_download_data(args) -> int:
     return 0
 
 
+def run_download_solaredge(args) -> int:
+    """Download power data from SolarEdge monitoring API and convert to standard CSV format."""
+    from datetime import datetime, timedelta
+
+    api_key = args.solaredge_api_key
+    site_id = args.solaredge_site_id
+    if not api_key or not site_id:
+        print("Error: --solaredge-api-key and --solaredge-site-id are required")
+        print("(or save them with: set-defaults --solaredge-api-key KEY --solaredge-site-id ID)")
+        return 1
+
+    base_url = "https://monitoringapi.solaredge.com"
+    power_dir = Path("download/power")
+    power_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine date range — SolarEdge API allows max 1 month per request
+    tz = LOCAL_TZ
+    end_date = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    start_date = end_date - timedelta(days=365)
+
+    print(f"Downloading SolarEdge data for site {site_id}")
+    print(f"  Date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+
+    # Download in monthly chunks (API limit)
+    all_frames = []
+    chunk_start = start_date
+    while chunk_start < end_date:
+        chunk_end = min(chunk_start + timedelta(days=30), end_date)
+        start_str = chunk_start.strftime("%Y-%m-%d %H:%M:%S")
+        end_str = chunk_end.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Fetch power details (includes Production, Consumption, FeedIn, Purchased)
+        url = f"{base_url}/site/{site_id}/powerDetails"
+        params = {
+            "api_key": api_key,
+            "startTime": start_str,
+            "endTime": end_str,
+            "timeUnit": "QUARTER_OF_AN_HOUR",
+            "meters": "PRODUCTION,CONSUMPTION,FEEDIN,PURCHASED",
+        }
+
+        try:
+            resp = requests.get(url, params=params, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as e:
+            print(f"  Error fetching {chunk_start.strftime('%Y-%m-%d')}: {e}")
+            chunk_start = chunk_end
+            continue
+
+        # Parse the response into rows
+        meters = data.get("powerDetails", {}).get("meters", [])
+        meter_data = {}
+        for meter in meters:
+            meter_type = meter.get("type", "").lower()
+            values = meter.get("values", [])
+            for v in values:
+                ts = v.get("date")
+                power = v.get("value")
+                if ts and power is not None:
+                    if ts not in meter_data:
+                        meter_data[ts] = {}
+                    meter_data[ts][meter_type] = float(power)
+
+        for ts, powers in sorted(meter_data.items()):
+            solar_power = powers.get("production", 0.0)
+            load_power = powers.get("consumption", 0.0)
+            feed_in = powers.get("feedin", 0.0)  # export to grid (positive = exporting)
+            purchased = powers.get("purchased", 0.0)  # import from grid (positive = importing)
+
+            # Convert to our standard format:
+            # grid_power: positive = importing, negative = exporting
+            grid_power = purchased - feed_in
+            # Estimate battery_power from the energy balance:
+            # solar + grid_import + battery_discharge = load + grid_export + battery_charge
+            # battery_power = load + grid_export - solar - grid_import
+            # (positive = discharging, negative = charging)
+            battery_power = load_power + feed_in - solar_power - purchased
+
+            all_frames.append({
+                "timestamp": ts,
+                "solar_power": solar_power,
+                "battery_power": battery_power,
+                "grid_power": grid_power,
+                "grid_services_power": 0,
+                "generator_power": 0,
+                "load_power": load_power,
+            })
+
+        print(f"    {chunk_start.strftime('%Y-%m-%d')} to {chunk_end.strftime('%Y-%m-%d')}: {len(meter_data)} readings")
+        chunk_start = chunk_end
+
+    if not all_frames:
+        print("  No data retrieved from SolarEdge API.")
+        return 1
+
+    # Convert to DataFrame and save
+    df = pd.DataFrame(all_frames)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"])
+
+    # Save per-day files for caching
+    df["date_str"] = df["timestamp"].dt.strftime("%Y-%m-%d")
+    for date_str, day_df in df.groupby("date_str"):
+        day_path = power_dir / f"{date_str}.csv"
+        day_df.drop(columns=["date_str"]).to_csv(day_path, index=False)
+
+    # Save combined file
+    combined_path = Path("download/power.csv")
+    df.drop(columns=["date_str"]).to_csv(combined_path, index=False)
+    print(f"\n  Saved {len(df)} rows to {combined_path}")
+    print(f"  Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+    print("\nDownload complete! Run the analysis with:")
+    print("  python octopus_powerwall_tariff_compare.py")
+    return 0
+
+
 def run_set_defaults(args) -> int:
     """Save or show user defaults."""
     if args.show:
@@ -1464,6 +1582,8 @@ def build_parser() -> argparse.ArgumentParser:
     sd.add_argument("--intelligent-offpeak-start", help="Intelligent off-peak window start (HH:MM)")
     sd.add_argument("--intelligent-offpeak-end", help="Intelligent off-peak window end (HH:MM)")
     sd.add_argument("--agile-standing-charge", type=float, help="Agile daily standing charge (p/day)")
+    sd.add_argument("--solaredge-api-key", help="SolarEdge monitoring API key")
+    sd.add_argument("--solaredge-site-id", help="SolarEdge site ID")
     sd.add_argument("--show", action="store_true", help="Show current saved defaults and exit")
 
     # ── default ───────────────────────────────────────────────────
@@ -1514,6 +1634,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Download a year of 5-minute Powerwall data from Tesla")
     download.add_argument("--email", default=d("email", None),
         help="Tesla account email address" + (f" (default: {d('email', None)})" if d("email", None) else ""))
+
+    # ── download-solaredge ────────────────────────────────────────
+    se_dl = sub.add_parser("download-solaredge",
+        help="Download a year of power data from SolarEdge monitoring API")
+    se_dl.add_argument("--solaredge-api-key", default=d("solaredge_api_key", None),
+        help="SolarEdge API key (from your monitoring portal)")
+    se_dl.add_argument("--solaredge-site-id", default=d("solaredge_site_id", None),
+        help="SolarEdge site ID")
 
     # ── list-regions ──────────────────────────────────────────────
     regions = sub.add_parser("list-regions",
@@ -1587,7 +1715,7 @@ like buying an EV, adding a hot tub, or installing extra solar panels.""",
     return parser
 
 
-SUBCOMMANDS = {"set-defaults", "default", "download-data", "list-regions", "refresh-tariffs", "model"}
+SUBCOMMANDS = {"set-defaults", "default", "download-data", "download-solaredge", "list-regions", "refresh-tariffs", "model"}
 
 
 def _inject_default_subcommand(argv: Optional[List[str]]) -> List[str]:
@@ -1627,6 +1755,8 @@ def main(argv=None) -> int:
             print("Error: --email is required (or save it with: set-defaults --email you@example.com)")
             return 1
         return run_download_data(args)
+    if args.command == "download-solaredge":
+        return run_download_solaredge(args)
     if args.command == "model":
         return run_model(args)
     if args.command == "default":

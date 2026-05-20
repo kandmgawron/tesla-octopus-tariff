@@ -72,6 +72,7 @@ python octopus_powerwall_tariff_compare.py --refresh-tariffs
 | _(none)_ / `default` | Run full battery optimisation analysis across all tariffs (auto-downloads Powerwall data when `--email` is saved) |
 | `model` | Model scenarios like adding an EV or hot tub |
 | `download-data` | Download 5-minute Powerwall data from Tesla (up to 1 year) |
+| `download-solaredge` | Download power data from SolarEdge monitoring API (up to 1 year) |
 | `set-defaults` | Save settings (region, battery, email) so you don't retype them |
 | `list-regions` | Show supported Octopus region codes |
 | `refresh-tariffs` | Re-download Agile tariff CSVs |
@@ -146,6 +147,28 @@ The `download-data` command (and the auto-download triggered by `default --email
 8. Paste the full URL into the terminal
 
 Your token is cached locally so you won't need to log in again unless it expires.
+
+## SolarEdge Systems
+
+If you have a SolarEdge inverter and battery, you can download data directly from the SolarEdge monitoring API:
+
+```bash
+# One-time setup
+python octopus_powerwall_tariff_compare.py set-defaults \
+  --solaredge-api-key YOUR_API_KEY \
+  --solaredge-site-id YOUR_SITE_ID \
+  --postcode "SW1A 1AA"
+
+# Download a year of data
+python octopus_powerwall_tariff_compare.py download-solaredge
+
+# Run the analysis
+python octopus_powerwall_tariff_compare.py
+```
+
+To get your API key: log in to the [SolarEdge monitoring portal](https://monitoring.solaredge.com), go to Admin > Site Access > API Access, and generate a key. Your site ID is shown in the portal URL.
+
+Data is downloaded at 15-minute intervals and converted to the standard format automatically. Battery power is estimated from the energy balance (production + grid = consumption + export).
 
 ## Using With Other Batteries
 
