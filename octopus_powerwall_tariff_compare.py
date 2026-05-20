@@ -605,18 +605,34 @@ def simulate_optimal_battery(
             slot_export_rate = export_rates[i]
 
             # ── Solar decision ──
-            # If export rate > import rate: export ALL solar, serve load from battery/grid
-            # Otherwise: solar serves load first, surplus to battery or export
+            # With battery available, the choice per kWh of solar is:
+            #   A) Self-consume: save slot_import_rate (avoided grid import). Battery unchanged.
+            #   B) Export solar + battery serves load: earn export_rate, battery depletes 1 kWh
+            #      which will be refilled at charge_threshold cost. Net = export_rate - charge_threshold.
+            # B is better than A when: export_rate - charge_threshold > 0
+            # (because the battery covers load either way — the question is just whether
+            # to also earn export revenue by sending solar to grid)
+            #
+            # But B only works if the battery has stored energy above the 10% reserve.
+            # If battery is depleted, fall back to: export solar only if export_rate > slot_import_rate.
             solar_to_load = 0.0
             solar_to_battery = 0.0
             solar_to_export = 0.0
             remaining_load = slot_load
 
-            if slot_export_rate > slot_import_rate:
-                # More profitable to export all solar and buy from grid
+            battery_can_cover_load = soc > min_soc
+            should_export_solar = False
+            if battery_can_cover_load and slot_export_rate > charge_threshold:
+                # Battery has cheap energy; exporting solar earns more than the refill cost
+                should_export_solar = True
+            elif not battery_can_cover_load and slot_export_rate > slot_import_rate:
+                # Battery empty; only export if export rate beats current import rate
+                should_export_solar = True
+
+            if should_export_solar:
                 solar_to_export = slot_solar
             else:
-                # Solar serves load first (avoids expensive import)
+                # Solar serves load first
                 solar_to_load = min(slot_solar, slot_load)
                 remaining_solar = slot_solar - solar_to_load
                 remaining_load = slot_load - solar_to_load
