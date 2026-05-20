@@ -686,20 +686,27 @@ def simulate_optimal_battery(
                 should_export_solar = True
 
             if should_export_solar:
-                solar_to_export = slot_solar
+                # Export solar up to grid export limit; excess charges battery or is curtailed
+                solar_to_export = min(slot_solar, slot_max_export_kwh)
+                remaining_solar = slot_solar - solar_to_export
+                if remaining_solar > 0:
+                    can_charge = min(remaining_solar, slot_max_charge_kwh, (battery_cap - soc) / battery_efficiency)
+                    can_charge = max(can_charge, 0.0)
+                    solar_to_battery = can_charge
+                    soc += solar_to_battery * battery_efficiency
             else:
                 # Solar serves load first
                 solar_to_load = min(slot_solar, slot_load)
                 remaining_solar = slot_solar - solar_to_load
                 remaining_load = slot_load - solar_to_load
 
-                # Surplus solar charges battery, then exports
+                # Surplus solar charges battery, then exports (capped by grid limit)
                 if remaining_solar > 0:
                     can_charge = min(remaining_solar, slot_max_charge_kwh, (battery_cap - soc) / battery_efficiency)
                     can_charge = max(can_charge, 0.0)
                     solar_to_battery = can_charge
                     soc += solar_to_battery * battery_efficiency
-                    solar_to_export = remaining_solar - solar_to_battery
+                    solar_to_export = min(remaining_solar - solar_to_battery, slot_max_export_kwh)
 
             # ── Serve remaining load: battery discharge or grid import ──
             battery_to_load = 0.0
