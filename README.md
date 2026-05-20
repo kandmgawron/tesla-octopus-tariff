@@ -144,3 +144,52 @@ The `download-data` command (and the auto-download triggered by `default --email
 8. Paste the full URL into the terminal
 
 Your token is cached locally so you won't need to log in again unless it expires.
+
+## Using With Other Batteries
+
+This tool works with any home battery system, not just Tesla Powerwalls. You just need your usage data in the right CSV format.
+
+**Battery specs are auto-detected** from the data — capacity, max charge rate, and max discharge rate are all inferred from observed behaviour. You can override any of them manually if needed:
+
+```bash
+python octopus_powerwall_tariff_compare.py --power-csv my_data.csv \
+    --battery-capacity-kwh 10 \
+    --battery-max-charge-kw 3.6 \
+    --battery-max-discharge-kw 3.6
+```
+
+### Required CSV Format
+
+Your CSV needs 5-minute interval readings with these columns:
+
+| Column | Required | Description |
+|--------|----------|-------------|
+| `timestamp` | Yes | ISO 8601 timestamp with timezone (e.g. `2025-09-01T14:00:00+01:00`) |
+| `grid_power` | Yes | Grid power in watts. Positive = importing, negative = exporting |
+| `solar_power` | No | Solar generation in watts (0 if no solar) |
+| `battery_power` | No | Battery power in watts. Negative = charging, positive = discharging |
+| `load_power` | No | Home consumption in watts |
+
+Example rows:
+
+```csv
+timestamp,solar_power,battery_power,grid_power,load_power
+2025-09-01T00:00:00+01:00,0.0,-5000.0,5300.0,300.0
+2025-09-01T00:05:00+01:00,0.0,-5000.0,5600.0,600.0
+2025-09-01T12:00:00+01:00,3500.0,0.0,-3200.0,300.0
+2025-09-01T18:00:00+01:00,0.0,2000.0,-1800.0,200.0
+```
+
+**Minimum required**: `timestamp` and `grid_power`. Without `solar_power` and `battery_power`, the tool can still run the simulation but won't auto-detect battery specs and will assume no solar generation.
+
+**Interval**: Data should be at 5-minute intervals. The tool aggregates to 30-minute slots internally.
+
+### Getting Data From Other Systems
+
+- **GivEnergy**: Export from the GivEnergy portal or use the GivTCP API
+- **SolarEdge**: Export from the monitoring portal (may need to convert from 15-min to 5-min)
+- **Solis/Ginlong**: Export from SolisCloud
+- **Home Assistant**: Export energy sensor data with a 5-minute recording interval
+- **Enphase**: Export from the Enlighten portal
+
+As long as you can produce a CSV with `timestamp` and `grid_power` at 5-minute intervals, the tool will work.

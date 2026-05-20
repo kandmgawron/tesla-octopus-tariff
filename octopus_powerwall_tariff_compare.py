@@ -289,6 +289,50 @@ def load_power_csv(path: Path, scenario: ScenarioConfig) -> pd.DataFrame:
     return hh
 
 
+def detect_battery_rates(path: Path) -> Tuple[float, float, float]:
+    """Detect max battery charge/discharge rates and usable capacity from the power CSV.
+
+    Uses the 99th percentile of observed battery_power values for rates (avoids
+    outlier spikes) and the 95th percentile of daily charge totals for capacity.
+    Returns (max_charge_kw, max_discharge_kw, capacity_kwh).
+    Falls back to (5.0, 5.0, 13.0) if battery_power column is missing.
+    """
+    try:
+        df = pd.read_csv(path, usecols=["timestamp", "battery_power"])
+    except (ValueError, KeyError):
+        return 5.0, 5.0, 13.0
+    if "battery_power" not in df.columns:
+        return 5.0, 5.0, 13.0
+    df["battery_power"] = pd.to_numeric(df["battery_power"], errors="coerce")
+    df = df.dropna(subset=["battery_power"])
+    if df.empty:
+        return 5.0, 5.0, 13.0
+
+    bp = df["battery_power"]
+
+    # Rates: 99th percentile
+    charging = bp[bp < 0]
+    discharging = bp[bp > 0]
+    max_charge_kw = abs(charging.quantile(0.01)) / 1000.0 if not charging.empty else 5.0
+    max_discharge_kw = discharging.quantile(0.99) / 1000.0 if not discharging.empty else 5.0
+
+    # Capacity: 95th percentile of daily charge totals
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df = df.dropna(subset=["timestamp"])
+    df["date"] = df["timestamp"].dt.date
+    # Energy charged per 5-min interval (negative battery_power = charging)
+    df["charge_kwh"] = np.where(bp.values < 0, np.abs(bp.values) / 12.0 / 1000.0, 0.0)
+    daily_charge = df.groupby("date")["charge_kwh"].sum()
+    if daily_charge.empty:
+        capacity_kwh = 13.0
+    else:
+        # 95th percentile of daily charge, rounded to nearest 0.5 kWh
+        raw = float(daily_charge.quantile(0.95))
+        capacity_kwh = round(raw * 2) / 2  # round to 0.5
+
+    return round(max_charge_kw, 1), round(max_discharge_kw, 1), round(capacity_kwh, 1)
+
+
 def trim_date_range(df: pd.DataFrame, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
     out = df.copy()
     if start:
@@ -736,17 +780,34 @@ def simulate_optimal_battery(
 
 def run_analyse(args) -> int:
     """Run full battery optimisation simulation across all tariffs."""
+    power_csv = Path(args.power_csv)
+    if not power_csv.exists():
+        print(f"Error: {args.power_csv} not found.")
+        return 1
+
+    # Auto-detect battery charge/discharge rates and capacity from data if not explicitly set
+    charge_kw = args.battery_max_charge_kw
+    discharge_kw = args.battery_max_discharge_kw
+    capacity_kwh = args.battery_capacity_kwh
+    auto_detected = charge_kw is None or discharge_kw is None or capacity_kwh is None
+    if auto_detected:
+        detected_charge, detected_discharge, detected_capacity = detect_battery_rates(power_csv)
+        if charge_kw is None:
+            charge_kw = detected_charge
+        if discharge_kw is None:
+            discharge_kw = detected_discharge
+        if capacity_kwh is None:
+            capacity_kwh = detected_capacity
+    args.battery_max_charge_kw = charge_kw
+    args.battery_max_discharge_kw = discharge_kw
+    args.battery_capacity_kwh = capacity_kwh
+
     scenario = ScenarioConfig(
         battery_capacity_kwh=args.battery_capacity_kwh,
         extra_daily_kwh=getattr(args, "extra_daily_kwh", 0.0),
         extra_start=getattr(args, "extra_start", "17:00"),
         extra_end=getattr(args, "extra_end", "22:00"),
     )
-
-    power_csv = Path(args.power_csv)
-    if not power_csv.exists():
-        print(f"Error: {args.power_csv} not found.")
-        return 1
 
     hh = load_power_csv(power_csv, scenario)
     hh = trim_date_range(hh, args.start_date, args.end_date)
@@ -763,8 +824,9 @@ def run_analyse(args) -> int:
     print(f"  Period: {num_days} days")
     print(f"  Solar generated: {total_solar:.1f} kWh ({total_solar / max(num_days, 1):.1f} kWh/day)")
     print(f"  Home consumption: {total_load:.1f} kWh ({total_load / max(num_days, 1):.1f} kWh/day)")
+    rate_note = " (auto-detected from data)" if auto_detected else ""
     print(f"  Battery: {args.battery_capacity_kwh} kWh capacity, "
-          f"{args.battery_max_charge_kw}/{args.battery_max_discharge_kw} kW charge/discharge")
+          f"{args.battery_max_charge_kw}/{args.battery_max_discharge_kw} kW charge/discharge{rate_note}")
     print(f"  Efficiency: {args.battery_efficiency * 100:.0f}% round-trip")
     print()
 
@@ -1338,12 +1400,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Octopus region code (default: %(default)s)")
     default.add_argument("--start-date", help="Only include data from this date onwards (YYYY-MM-DD)")
     default.add_argument("--end-date", help="Only include data up to this date (YYYY-MM-DD)")
-    default.add_argument("--battery-capacity-kwh", type=float, default=d("battery_capacity_kwh", 13.0),
-        help="Powerwall usable capacity in kWh (default: %(default)s)")
-    default.add_argument("--battery-max-charge-kw", type=float, default=5.0,
-        help="Maximum battery charge rate in kW (default: %(default)s)")
-    default.add_argument("--battery-max-discharge-kw", type=float, default=5.0,
-        help="Maximum battery discharge rate in kW (default: %(default)s)")
+    default.add_argument("--battery-capacity-kwh", type=float, default=d("battery_capacity_kwh", None),
+        help="Powerwall usable capacity in kWh (default: auto-detected from data)")
+    default.add_argument("--battery-max-charge-kw", type=float, default=None,
+        help="Maximum battery charge rate in kW (default: auto-detected from data)")
+    default.add_argument("--battery-max-discharge-kw", type=float, default=None,
+        help="Maximum battery discharge rate in kW (default: auto-detected from data)")
     default.add_argument("--battery-efficiency", type=float, default=0.90,
         help="Battery round-trip efficiency 0-1 (default: %(default)s)")
     default.add_argument("--refresh-tariffs", action="store_true",
@@ -1406,12 +1468,12 @@ like buying an EV, adding a hot tub, or installing extra solar panels.""",
         help="Directory for cached tariff CSVs (default: %(default)s)")
     model.add_argument("--region-code", default=d("region_code", "M"),
         help="Octopus region code (default: %(default)s)")
-    model.add_argument("--battery-capacity-kwh", type=float, default=d("battery_capacity_kwh", 13.0),
-        help="Powerwall usable capacity in kWh (default: %(default)s)")
-    model.add_argument("--battery-max-charge-kw", type=float, default=5.0,
-        help="Maximum battery charge rate in kW (default: %(default)s)")
-    model.add_argument("--battery-max-discharge-kw", type=float, default=5.0,
-        help="Maximum battery discharge rate in kW (default: %(default)s)")
+    model.add_argument("--battery-capacity-kwh", type=float, default=d("battery_capacity_kwh", None),
+        help="Powerwall usable capacity in kWh (default: auto-detected from data)")
+    model.add_argument("--battery-max-charge-kw", type=float, default=None,
+        help="Maximum battery charge rate in kW (default: auto-detected from data)")
+    model.add_argument("--battery-max-discharge-kw", type=float, default=None,
+        help="Maximum battery discharge rate in kW (default: auto-detected from data)")
     model.add_argument("--battery-efficiency", type=float, default=0.90,
         help="Battery round-trip efficiency 0-1 (default: %(default)s)")
     model.add_argument("--tariffs",
