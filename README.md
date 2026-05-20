@@ -40,8 +40,7 @@ pip install -r requirements.txt
 ```bash
 python octopus_powerwall_tariff_compare.py set-defaults \
   --email your-tesla-email@example.com \
-  --region-code M \
-  --battery-capacity-kwh 13
+  --region-code M
 ```
 
 ### 2. Run the analysis
