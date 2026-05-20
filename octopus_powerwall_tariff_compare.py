@@ -578,6 +578,7 @@ def simulate_optimal_battery(
     battery_max_discharge_kw: float = 5.0,
     battery_efficiency: float = 0.90,
     grid_export_limit_kw: float = 3.68,
+    battery_age_years: float = 0.0,
 ):
     """Simulate optimal battery usage with corrected solar export logic.
 
@@ -615,10 +616,15 @@ def simulate_optimal_battery(
     if df.empty:
         return None, None
 
+    # Apply battery degradation: ~2% capacity loss and ~0.5% efficiency loss per year
+    degradation_factor = max(1.0 - 0.02 * battery_age_years, 0.5)
+    battery_cap = scenario.battery_capacity_kwh * degradation_factor
+    effective_efficiency = min(battery_efficiency, battery_efficiency - 0.005 * battery_age_years)
+    effective_efficiency = max(effective_efficiency, 0.70)  # floor at 70%
+
     slot_max_charge_kwh = battery_max_charge_kw * 0.5
     slot_max_discharge_kwh = battery_max_discharge_kw * 0.5
     slot_max_export_kwh = grid_export_limit_kw * 0.5  # DNO grid export cap per 30-min slot
-    battery_cap = scenario.battery_capacity_kwh
     min_soc = battery_cap * 0.10  # 10% reserve
 
     daily_rows = []
@@ -639,14 +645,18 @@ def simulate_optimal_battery(
         import_rates = group["import_rate_p"].values
         export_rates = group["export_rate_p"].values
 
-        # Determine charge threshold: the rate at the boundary where battery fills
-        # from the cheapest slots. Slots below this are "cheap" (charge), above are "expensive" (discharge).
+        # Determine charge threshold based on how much space the battery actually has.
+        # Only need enough cheap slots to fill the remaining capacity, not the full battery.
+        available_capacity = max(battery_cap - soc, 0.0)
+        slots_to_fill = int(np.ceil(available_capacity / slot_max_charge_kwh)) if available_capacity > 0.1 else 0
         sorted_rates = np.sort(import_rates)
-        slots_to_fill = int(np.ceil(battery_cap / slot_max_charge_kwh))
-        if slots_to_fill < n_slots:
+        if slots_to_fill > 0 and slots_to_fill < n_slots:
             charge_threshold = sorted_rates[min(slots_to_fill, n_slots - 1)]
-        else:
+        elif slots_to_fill >= n_slots:
             charge_threshold = sorted_rates[-1]
+        else:
+            # Battery is already full — threshold is the minimum rate (don't charge)
+            charge_threshold = sorted_rates[0]
 
         # Simulate slot by slot (soc carries over from previous day)
         opt_import_cost_p = 0.0
@@ -678,7 +688,10 @@ def simulate_optimal_battery(
 
             battery_can_cover_load = soc > min_soc
             should_export_solar = False
-            if battery_can_cover_load and slot_export_rate > charge_threshold:
+            if slot_export_rate <= 0:
+                # Negative export rate — never export (you'd pay to do so)
+                should_export_solar = False
+            elif battery_can_cover_load and slot_export_rate > charge_threshold:
                 # Battery has cheap energy; exporting solar earns more than the refill cost
                 should_export_solar = True
             elif not battery_can_cover_load and slot_export_rate > slot_import_rate:
@@ -690,10 +703,10 @@ def simulate_optimal_battery(
                 solar_to_export = min(slot_solar, slot_max_export_kwh)
                 remaining_solar = slot_solar - solar_to_export
                 if remaining_solar > 0:
-                    can_charge = min(remaining_solar, slot_max_charge_kwh, (battery_cap - soc) / battery_efficiency)
+                    can_charge = min(remaining_solar, slot_max_charge_kwh, (battery_cap - soc) / effective_efficiency)
                     can_charge = max(can_charge, 0.0)
                     solar_to_battery = can_charge
-                    soc += solar_to_battery * battery_efficiency
+                    soc += solar_to_battery * effective_efficiency
             else:
                 # Solar serves load first
                 solar_to_load = min(slot_solar, slot_load)
@@ -702,10 +715,10 @@ def simulate_optimal_battery(
 
                 # Surplus solar charges battery, then exports (capped by grid limit)
                 if remaining_solar > 0:
-                    can_charge = min(remaining_solar, slot_max_charge_kwh, (battery_cap - soc) / battery_efficiency)
+                    can_charge = min(remaining_solar, slot_max_charge_kwh, (battery_cap - soc) / effective_efficiency)
                     can_charge = max(can_charge, 0.0)
                     solar_to_battery = can_charge
-                    soc += solar_to_battery * battery_efficiency
+                    soc += solar_to_battery * effective_efficiency
                     solar_to_export = min(remaining_solar - solar_to_battery, slot_max_export_kwh)
 
             # ── Serve remaining load: battery discharge or grid import ──
@@ -725,16 +738,16 @@ def simulate_optimal_battery(
             if slot_import_rate < charge_threshold and soc < battery_cap:
                 available_charge = min(
                     slot_max_charge_kwh - solar_to_battery,
-                    (battery_cap - soc) / battery_efficiency,
+                    (battery_cap - soc) / effective_efficiency,
                 )
                 available_charge = max(available_charge, 0.0)
                 if available_charge > 0.01:
                     grid_to_battery = available_charge
-                    soc += grid_to_battery * battery_efficiency
+                    soc += grid_to_battery * effective_efficiency
 
             # ── Discharge battery to export when export rate is high ──
             battery_to_export = 0.0
-            if slot_export_rate > charge_threshold and soc > min_soc:
+            if slot_export_rate > charge_threshold and slot_export_rate > 0 and soc > min_soc:
                 # Cap by: battery discharge rate, available SoC, and remaining grid export headroom
                 grid_export_headroom = max(slot_max_export_kwh - solar_to_export, 0.0)
                 available_discharge = min(
@@ -963,6 +976,7 @@ def run_analyse(args) -> int:
             battery_max_discharge_kw=args.battery_max_discharge_kw,
             battery_efficiency=args.battery_efficiency,
             grid_export_limit_kw=args.grid_export_limit_kw,
+            battery_age_years=getattr(args, "battery_age_years", 0.0),
         )
         if s is not None:
             summaries.append(s)
@@ -1438,6 +1452,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Battery round-trip efficiency 0-1 (default: %(default)s)")
     default.add_argument("--grid-export-limit-kw", type=float, default=None,
         help="Grid export limit in kW, e.g. DNO G98=3.68, G99=6.0 (default: auto-detected from data)")
+    default.add_argument("--battery-age-years", type=float, default=0.0,
+        help="Battery age in years for degradation modelling (default: %(default)s)")
     default.add_argument("--refresh-tariffs", action="store_true",
         help="Re-download tariff data even if cached")
     default.add_argument("--tariffs",
@@ -1508,6 +1524,8 @@ like buying an EV, adding a hot tub, or installing extra solar panels.""",
         help="Battery round-trip efficiency 0-1 (default: %(default)s)")
     model.add_argument("--grid-export-limit-kw", type=float, default=None,
         help="Grid export limit in kW, e.g. DNO G98=3.68, G99=6.0 (default: auto-detected from data)")
+    model.add_argument("--battery-age-years", type=float, default=0.0,
+        help="Battery age in years for degradation modelling (default: %(default)s)")
     model.add_argument("--tariffs",
         help="Comma-separated list of tariffs to simulate (default: all). "
              "Options: intelligent,agile,go,flux,cosy,flexible,tracker")
