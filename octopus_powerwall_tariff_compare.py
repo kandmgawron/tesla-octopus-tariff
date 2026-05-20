@@ -202,6 +202,24 @@ def region_name_from_code(region_code: str) -> str:
     return REGION_CODE_TO_NAME[code]
 
 
+def region_from_postcode(postcode: str) -> str:
+    """Look up the Octopus Energy region code for a UK postcode."""
+    postcode = postcode.strip().replace(" ", "")
+    url = f"https://api.octopus.energy/v1/industry/grid-supply-points/?postcode={postcode}"
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    results = data.get("results", [])
+    if not results:
+        raise ValueError(f"No region found for postcode '{postcode}'")
+    # Group ID is like "_A", "_B" etc — extract the letter
+    group_id = results[0].get("group_id", "")
+    code = group_id.lstrip("_")
+    if code not in REGION_CODE_TO_NAME:
+        raise ValueError(f"Unexpected region '{code}' for postcode '{postcode}'")
+    return code
+
+
 def download_region_tariffs(
     region_code: str, cache_dir: Path,
     index_url: str = DEFAULT_TARIFF_INDEX, force: bool = False,
@@ -632,12 +650,20 @@ def simulate_optimal_battery(
     total_opt_export_revenue_p = 0.0
     total_days = 0
     soc = battery_cap * 0.5  # First day starts at 50%; subsequent days carry over
+    prev_day = None
 
     for day, group in df.groupby("date", sort=True):
         group = group.copy().sort_values("slot_start").reset_index(drop=True)
         n_slots = len(group)
         if n_slots == 0:
             continue
+
+        # Reset SoC if there's a gap of more than 1 day (data missing/Powerwall offline)
+        if prev_day is not None:
+            gap_days = (day - prev_day).days
+            if gap_days > 1:
+                soc = battery_cap * 0.5
+        prev_day = day
         total_days += 1
 
         solar = group["solar_kwh"].values
@@ -688,8 +714,9 @@ def simulate_optimal_battery(
 
             battery_can_cover_load = soc > min_soc
             should_export_solar = False
-            if slot_export_rate <= 0:
-                # Negative export rate — never export (you'd pay to do so)
+            if slot_export_rate <= 0 or slot_import_rate < 0:
+                # Negative export rate or negative import rate — don't export.
+                # When import is negative (paid to consume), keep solar for load and maximise grid import.
                 should_export_solar = False
             elif battery_can_cover_load and slot_export_rate > charge_threshold:
                 # Battery has cheap energy; exporting solar earns more than the refill cost
@@ -725,8 +752,9 @@ def simulate_optimal_battery(
             battery_to_load = 0.0
             grid_to_load = 0.0
             if remaining_load > 0:
-                # Discharge battery if import rate is expensive (above threshold)
-                if slot_import_rate >= charge_threshold and soc > min_soc:
+                # If import rate is negative (we're paid to consume), always use grid
+                # Otherwise discharge battery if import rate is expensive (above threshold)
+                if slot_import_rate >= charge_threshold and slot_import_rate > 0 and soc > min_soc:
                     can_discharge = min(remaining_load, slot_max_discharge_kwh, soc - min_soc)
                     battery_to_load = can_discharge
                     soc -= battery_to_load
@@ -734,8 +762,9 @@ def simulate_optimal_battery(
                 grid_to_load = remaining_load
 
             # ── Charge battery from grid during cheap slots ──
+            # When import rate is negative, always charge as much as possible (we're paid to consume)
             grid_to_battery = 0.0
-            if slot_import_rate < charge_threshold and soc < battery_cap:
+            if (slot_import_rate < charge_threshold or slot_import_rate < 0) and soc < battery_cap:
                 available_charge = min(
                     slot_max_charge_kwh - solar_to_battery,
                     (battery_cap - soc) / effective_efficiency,
@@ -806,6 +835,7 @@ def simulate_optimal_battery(
         "optimised_export_gbp": round(pence_to_pounds(total_opt_export_revenue_p), 2),
         "standing_charge_gbp": round(pence_to_pounds(total_sc_p), 2),
         "optimised_net_gbp": round(pence_to_pounds(opt_net_total_p), 2),
+        "annual_net_gbp": round(pence_to_pounds(opt_net_total_p) / max(total_days, 1) * 365, 0),
     }
     return summary, pd.DataFrame(daily_rows)
 
@@ -869,6 +899,12 @@ def run_analyse(args) -> int:
     print(f"  Grid export limit: {args.grid_export_limit_kw} kW{rate_note}")
     print(f"  Efficiency: {args.battery_efficiency * 100:.0f}% round-trip")
     print()
+
+    # Resolve region from postcode if provided
+    if getattr(args, "postcode", None):
+        args.region_code = region_from_postcode(args.postcode)
+        print(f"  Region: {args.region_code} ({REGION_CODE_TO_NAME[args.region_code]}) — from postcode")
+        print()
 
     # Determine which tariffs to simulate
     tariffs_to_run = getattr(args, "tariffs", None)
@@ -991,26 +1027,24 @@ def run_analyse(args) -> int:
     write_csv(summary_df, out_dir / "summary.csv")
 
     # Print results
-    print("With optimal battery scheduling, your costs would be:")
+    print("With optimal battery scheduling, your annual costs would be:")
     print()
-    headers = ["tariff", "optimised_import_gbp", "optimised_export_gbp", "standing_charge_gbp", "optimised_net_gbp"]
+    headers = ["tariff", "annual_net_gbp", "optimised_net_gbp", "standing_charge_gbp"]
     rows = summary_df.to_dict(orient="records")
     print_summary_table(rows, headers=headers)
 
     best_row = rows[0]
+    days = best_row["days"]
     print(f"\n{'=' * 70}")
     print(f"  BEST TARIFF: {best_row['tariff'].upper()}")
-    days = best_row["days"]
-    net = best_row["optimised_net_gbp"]
-    annual = net / max(days, 1) * 365
-    print(f"  Optimised net cost: \u00a3{net:.2f} over {days} days (\u00a3{annual:.0f}/year)")
+    print(f"  Estimated annual cost: \u00a3{best_row['annual_net_gbp']:.0f}/year")
+    print(f"  (Based on {days} days of data)")
     print(f"{'=' * 70}")
 
     if len(rows) > 1:
         worst_row = rows[-1]
-        spread = worst_row["optimised_net_gbp"] - best_row["optimised_net_gbp"]
-        annual_spread = spread / max(days, 1) * 365
-        print(f"\n  Spread between best and worst: \u00a3{spread:.2f} (\u00a3{annual_spread:.0f}/year)")
+        spread = worst_row["annual_net_gbp"] - best_row["annual_net_gbp"]
+        print(f"\n  Annual spread between best and worst: \u00a3{spread:.0f}/year")
 
     print(f"\nOutputs written to: {out_dir}")
     return 0
@@ -1440,6 +1474,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory for cached tariff CSVs (default: %(default)s)")
     default.add_argument("--region-code", default=d("region_code", "M"),
         help="Octopus region code (default: %(default)s)")
+    default.add_argument("--postcode",
+        help="UK postcode to auto-detect region (alternative to --region-code)")
     default.add_argument("--start-date", help="Only include data from this date onwards (YYYY-MM-DD)")
     default.add_argument("--end-date", help="Only include data up to this date (YYYY-MM-DD)")
     default.add_argument("--battery-capacity-kwh", type=float, default=d("battery_capacity_kwh", None),
