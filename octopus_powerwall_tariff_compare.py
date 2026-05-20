@@ -535,6 +535,7 @@ def simulate_optimal_battery(
     - Discharge to serve load when import rate is above threshold
     - Discharge to export when export rate is above threshold (keep 10% reserve)
     - Charge threshold = rate at the slot where battery would be full from cheapest slots
+    - State of charge carries across days (no artificial daily reset)
     """
     df = hh.copy()
     df["date"] = df["slot_start"].dt.date
@@ -568,6 +569,7 @@ def simulate_optimal_battery(
     total_opt_import_cost_p = 0.0
     total_opt_export_revenue_p = 0.0
     total_days = 0
+    soc = battery_cap * 0.5  # First day starts at 50%; subsequent days carry over
 
     for day, group in df.groupby("date", sort=True):
         group = group.copy().sort_values("slot_start").reset_index(drop=True)
@@ -590,8 +592,7 @@ def simulate_optimal_battery(
         else:
             charge_threshold = sorted_rates[-1]
 
-        # Simulate slot by slot
-        soc = battery_cap * 0.5  # Start day at 50%
+        # Simulate slot by slot (soc carries over from previous day)
         opt_import_cost_p = 0.0
         opt_export_revenue_p = 0.0
         opt_grid_import_kwh = 0.0
