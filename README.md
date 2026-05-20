@@ -44,37 +44,27 @@ python octopus_powerwall_tariff_compare.py set-defaults \
   --battery-capacity-kwh 13
 ```
 
-### 2. Download your Powerwall data
-
-```bash
-python octopus_powerwall_tariff_compare.py download-data
-```
-
-Data is saved to `download/power.csv`. Per-day files are cached in `download/power/`.
-
-### 3. Run the analysis
+### 2. Run the analysis
 
 ```bash
 python octopus_powerwall_tariff_compare.py
 ```
 
-No subcommand needed. This auto-downloads any new Powerwall data, then simulates optimal battery behaviour for all 7 tariffs and shows which is cheapest.
+That's it. This auto-downloads your Powerwall data from Tesla (up to a year of history), fetches tariff rates, then simulates optimal battery behaviour for all 7 tariffs and shows which is cheapest. Per-day data is cached in `download/power/` so subsequent runs only download new days.
 
 To compare only specific tariffs:
 
 ```bash
-python octopus_powerwall_tariff_compare.py --power-csv download/power.csv --tariffs flux,intelligent,agile
+python octopus_powerwall_tariff_compare.py --tariffs flux,intelligent,agile
 ```
 
-### All-in-one: download + refresh tariffs + analyse
-
-If you've saved your email with `set-defaults --email`, the bare command auto-downloads any new Powerwall data before running the analysis.
+To also refresh cached tariff rate data:
 
 ```bash
 python octopus_powerwall_tariff_compare.py --refresh-tariffs
 ```
 
-`--refresh-tariffs` re-downloads the Agile/Tracker rate data even if cached.
+**`--power-csv`** — You only need this if your Powerwall data lives somewhere other than the default `download/power.csv` (e.g. you exported it manually or have multiple sites). If you've used `set-defaults --email` the tool downloads and merges data to that path automatically.
 
 ## Commands
 
