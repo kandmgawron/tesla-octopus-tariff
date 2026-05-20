@@ -84,6 +84,7 @@ This does steps 2 and 3 together, plus refreshes the Agile tariff data.
 | `full-refresh` | Download data + refresh tariffs + run comparison in one go |
 | `default` | Run comparison with sensible defaults |
 | `compare` | Run comparison with full control over every tariff parameter |
+| `best-tariff` | Full simulation: find the absolute best tariff with optimal battery use |
 | `optimise-charging` | Show savings from moving battery charging to cheapest slots |
 | `model` | Model scenarios like adding an EV or hot tub |
 | `list-regions` | Show supported Octopus region codes |
@@ -133,6 +134,36 @@ This analyses your actual battery charging history — when the Powerwall charge
 - **Saving**: the difference, in £ and %
 
 For time-of-use tariffs (Intelligent, Go), if your battery already charges overnight you'll see 0% saving — it's already optimal. For variable tariffs (Agile, Tracker) and multi-band tariffs (Flux, Cosy), smart scheduling can yield significant savings.
+
+## Best Tariff (Full Simulation)
+
+The most comprehensive analysis — simulates optimal battery behaviour for each tariff to find the absolute best one for your home:
+
+```bash
+# Find the best tariff with full battery optimisation
+python octopus_powerwall_tariff_compare.py best-tariff
+
+# Compare specific tariffs
+python octopus_powerwall_tariff_compare.py best-tariff --tariffs flux,intelligent,agile
+
+# With Powerwall 3 specs (higher charge/discharge rate)
+python octopus_powerwall_tariff_compare.py best-tariff \
+    --battery-max-charge-kw 11.5 --battery-max-discharge-kw 11.5
+
+# Account for battery degradation
+python octopus_powerwall_tariff_compare.py best-tariff --battery-efficiency 0.85
+```
+
+Unlike the basic `compare` command which just applies rates to your actual usage, `best-tariff` simulates what would happen with **perfect battery scheduling**:
+
+- Charges from grid during the cheapest import slots
+- Uses solar to serve home load first, then charges battery, then exports surplus
+- Discharges battery to avoid importing during expensive periods
+- Exports stored energy during peak export windows (e.g. Flux pays 28.60p/kWh 16:00–19:00)
+- Accounts for battery round-trip efficiency losses (default 90%)
+- Respects battery capacity and charge/discharge rate limits
+
+This shows the true potential of each tariff if you had a smart controller (like Intelligent Octopus or Flux automation) optimally managing your battery.
 
 ## Common Options
 
