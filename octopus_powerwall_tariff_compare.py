@@ -831,11 +831,11 @@ def simulate_optimal_battery(
     summary = {
         "tariff": tariff_name,
         "days": total_days,
-        "optimised_import_gbp": round(pence_to_pounds(total_opt_import_cost_p), 2),
-        "optimised_export_gbp": round(pence_to_pounds(total_opt_export_revenue_p), 2),
-        "standing_charge_gbp": round(pence_to_pounds(total_sc_p), 2),
-        "optimised_net_gbp": round(pence_to_pounds(opt_net_total_p), 2),
-        "annual_net_gbp": round(pence_to_pounds(opt_net_total_p) / max(total_days, 1) * 365, 0),
+        "import_£": round(pence_to_pounds(total_opt_import_cost_p), 2),
+        "export_£": round(pence_to_pounds(total_opt_export_revenue_p), 2),
+        "standing_£": round(pence_to_pounds(total_sc_p), 2),
+        "total_£": round(pence_to_pounds(opt_net_total_p), 2),
+        "annual_£": round(pence_to_pounds(opt_net_total_p) / max(total_days, 1) * 365, 0),
     }
     return summary, pd.DataFrame(daily_rows)
 
@@ -1022,14 +1022,14 @@ def run_analyse(args) -> int:
         print("No tariff data available for simulation.")
         return 1
 
-    # Sort by optimised net cost
-    summary_df = pd.DataFrame(summaries).sort_values("optimised_net_gbp")
+    # Sort by total net cost
+    summary_df = pd.DataFrame(summaries).sort_values("total_£")
     write_csv(summary_df, out_dir / "summary.csv")
 
     # Print results
     print("With optimal battery scheduling, your annual costs would be:")
     print()
-    headers = ["tariff", "annual_net_gbp", "optimised_net_gbp", "standing_charge_gbp"]
+    headers = ["tariff", "import_£", "export_£", "standing_£", "total_£", "annual_£"]
     rows = summary_df.to_dict(orient="records")
     print_summary_table(rows, headers=headers)
 
@@ -1037,13 +1037,13 @@ def run_analyse(args) -> int:
     days = best_row["days"]
     print(f"\n{'=' * 70}")
     print(f"  BEST TARIFF: {best_row['tariff'].upper()}")
-    print(f"  Estimated annual cost: \u00a3{best_row['annual_net_gbp']:.0f}/year")
+    print(f"  Estimated annual cost: \u00a3{best_row['annual_£']:.0f}/year")
     print(f"  (Based on {days} days of data)")
     print(f"{'=' * 70}")
 
     if len(rows) > 1:
         worst_row = rows[-1]
-        spread = worst_row["annual_net_gbp"] - best_row["annual_net_gbp"]
+        spread = worst_row["annual_£"] - best_row["annual_£"]
         print(f"\n  Annual spread between best and worst: \u00a3{spread:.0f}/year")
 
     print(f"\nOutputs written to: {out_dir}")
@@ -1240,12 +1240,18 @@ def run_set_defaults(args) -> int:
         saved = load_defaults()
         if not saved:
             print("No defaults saved yet. Use set-defaults with options to save them.")
-            print("Example: set-defaults --region-code M --battery-capacity-kwh 13 --email you@example.com")
+            print("Example: set-defaults --postcode 'SW1A 1AA' --email you@example.com")
         else:
             print("Saved defaults:")
             for key, value in sorted(saved.items()):
                 print(f"  {key}: {value}")
         return 0
+
+    # Resolve postcode to region code if provided
+    if getattr(args, "postcode", None):
+        code = region_from_postcode(args.postcode)
+        args.region_code = code
+        print(f"  Postcode {args.postcode} → region {code} ({REGION_CODE_TO_NAME[code]})")
 
     saved = load_defaults()
     updated = False
@@ -1257,7 +1263,7 @@ def run_set_defaults(args) -> int:
 
     if not updated:
         print("No values provided. Use --show to see current defaults, or pass options to save.")
-        print("Example: set-defaults --region-code M --battery-capacity-kwh 13 --email you@example.com")
+        print("Example: set-defaults --postcode 'SW1A 1AA' --email you@example.com")
         return 0
 
     save_defaults(saved)
@@ -1353,7 +1359,7 @@ def run_model(args) -> int:
             row["scenario"] = " + ".join(cumulative_labels)
             all_rows.append(row)
 
-    headers = ["scenario", "tariff", "optimised_import_gbp", "optimised_export_gbp", "standing_charge_gbp", "optimised_net_gbp"]
+    headers = ["scenario", "tariff", "import_£", "export_£", "standing_£", "total_£", "annual_£"]
     print_summary_table(all_rows, headers=headers)
 
     combined_df = pd.DataFrame(all_rows)
@@ -1422,7 +1428,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
   # Save your settings once
-  %(prog)s set-defaults --region-code M --battery-capacity-kwh 13 --email you@example.com
+  %(prog)s set-defaults --postcode "SW1A 1AA" --email you@example.com
 
   # Download a year of Powerwall data (uses saved email)
   %(prog)s download-data
@@ -1442,7 +1448,8 @@ def build_parser() -> argparse.ArgumentParser:
     # ── set-defaults ──────────────────────────────────────────────
     sd = sub.add_parser("set-defaults",
         help="Save default settings so you don't have to type them every time")
-    sd.add_argument("--region-code", help="Octopus region code (run list-regions to see options)")
+    sd.add_argument("--postcode", help="UK postcode (auto-detects your Octopus region)")
+    sd.add_argument("--region-code", help="Octopus region code (alternative to --postcode, run list-regions to see options)")
     sd.add_argument("--battery-capacity-kwh", type=float, help="Powerwall usable capacity in kWh")
     sd.add_argument("--extra-daily-kwh", type=float, help="Extra daily consumption to model (kWh)")
     sd.add_argument("--extra-start", help="Start of extra consumption window (HH:MM)")

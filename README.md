@@ -40,7 +40,7 @@ pip install -r requirements.txt
 ```bash
 python octopus_powerwall_tariff_compare.py set-defaults \
   --email your-tesla-email@example.com \
-  --region-code M
+  --postcode "SW1A 1AA"
 ```
 
 ### 2. Run the analysis
@@ -101,7 +101,10 @@ python octopus_powerwall_tariff_compare.py model \
 ## Common Options
 
 ```bash
-# Use a different region (C = London)
+# Use a different region (by postcode)
+python octopus_powerwall_tariff_compare.py --power-csv power.csv --postcode "EC1A 1BB"
+
+# Or by region code directly
 python octopus_powerwall_tariff_compare.py --power-csv power.csv --region-code C
 
 # Bigger battery (e.g. 2x Powerwall 2)
