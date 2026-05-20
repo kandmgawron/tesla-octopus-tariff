@@ -84,6 +84,7 @@ This does steps 2 and 3 together, plus refreshes the Agile tariff data.
 | `full-refresh` | Download data + refresh tariffs + run comparison in one go |
 | `default` | Run comparison with sensible defaults |
 | `compare` | Run comparison with full control over every tariff parameter |
+| `optimise-charging` | Show savings from moving battery charging to cheapest slots |
 | `model` | Model scenarios like adding an EV or hot tub |
 | `list-regions` | Show supported Octopus region codes |
 | `refresh-tariffs` | Re-download Agile tariff CSVs |
@@ -109,6 +110,29 @@ python octopus_powerwall_tariff_compare.py model \
   --power-csv download/power.csv \
   --label "Insulation" --adjust-kwh -3 --window 06:00-22:00
 ```
+
+## Optimised Battery Charging
+
+See how much you could save by scheduling your Powerwall to charge at the cheapest times:
+
+```bash
+# Analyse all tariffs
+python octopus_powerwall_tariff_compare.py optimise-charging
+
+# Just check variable tariffs where smart scheduling matters most
+python octopus_powerwall_tariff_compare.py optimise-charging --tariffs agile,tracker,flux
+
+# With a Powerwall 3 (higher charge rate = more flexibility)
+python octopus_powerwall_tariff_compare.py optimise-charging --battery-max-charge-kw 11.5
+```
+
+This analyses your actual battery charging history — when the Powerwall charged from the grid and at what rate — then simulates moving that same energy to the cheapest available slots each day. It shows:
+
+- **Actual cost**: what you paid for battery charging based on when it happened
+- **Optimised cost**: what you would have paid if charging was scheduled optimally
+- **Saving**: the difference, in £ and %
+
+For time-of-use tariffs (Intelligent, Go), if your battery already charges overnight you'll see 0% saving — it's already optimal. For variable tariffs (Agile, Tracker) and multi-band tariffs (Flux, Cosy), smart scheduling can yield significant savings.
 
 ## Common Options
 
