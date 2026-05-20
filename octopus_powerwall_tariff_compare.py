@@ -289,32 +289,43 @@ def load_power_csv(path: Path, scenario: ScenarioConfig) -> pd.DataFrame:
     return hh
 
 
-def detect_battery_rates(path: Path) -> Tuple[float, float, float]:
-    """Detect max battery charge/discharge rates and usable capacity from the power CSV.
+def detect_battery_rates(path: Path) -> Tuple[float, float, float, float]:
+    """Detect battery specs and grid export limit from the power CSV.
 
-    Uses the 99th percentile of observed battery_power values for rates (avoids
-    outlier spikes) and the 95th percentile of daily charge totals for capacity.
-    Returns (max_charge_kw, max_discharge_kw, capacity_kwh).
-    Falls back to (5.0, 5.0, 13.0) if battery_power column is missing.
+    Returns (max_charge_kw, max_discharge_kw, capacity_kwh, grid_export_limit_kw).
+    - Charge rate: 99th percentile of observed charging power
+    - Discharge rate: same as charge rate (hardware is symmetric)
+    - Capacity: 95th percentile of daily charge totals, rounded to 0.5 kWh
+    - Grid export limit: 99th percentile of observed grid export (DNO limit)
+    Falls back to (5.0, 5.0, 13.0, 3.68) if columns are missing.
     """
     try:
-        df = pd.read_csv(path, usecols=["timestamp", "battery_power"])
+        df = pd.read_csv(path, usecols=["timestamp", "battery_power", "grid_power"])
     except (ValueError, KeyError):
-        return 5.0, 5.0, 13.0
+        return 5.0, 5.0, 13.0, 3.68
     if "battery_power" not in df.columns:
-        return 5.0, 5.0, 13.0
+        return 5.0, 5.0, 13.0, 3.68
     df["battery_power"] = pd.to_numeric(df["battery_power"], errors="coerce")
+    df["grid_power"] = pd.to_numeric(df["grid_power"], errors="coerce")
     df = df.dropna(subset=["battery_power"])
     if df.empty:
-        return 5.0, 5.0, 13.0
+        return 5.0, 5.0, 13.0, 3.68
 
     bp = df["battery_power"]
 
-    # Rates: 99th percentile
+    # Charge rate: 99th percentile of charging observations (battery always charges at max)
     charging = bp[bp < 0]
-    discharging = bp[bp > 0]
     max_charge_kw = abs(charging.quantile(0.01)) / 1000.0 if not charging.empty else 5.0
-    max_discharge_kw = discharging.quantile(0.99) / 1000.0 if not discharging.empty else 5.0
+    # Discharge rate: use charge rate as proxy for hardware limit (discharge to load can match it)
+    max_discharge_kw = max_charge_kw
+
+    # Grid export limit: 99th percentile of observed export (negative grid_power)
+    gp = df["grid_power"].dropna()
+    grid_exports = gp[gp < 0].abs()
+    if not grid_exports.empty:
+        grid_export_limit_kw = grid_exports.quantile(0.99) / 1000.0
+    else:
+        grid_export_limit_kw = 3.68  # UK single-phase G98 default
 
     # Capacity: 95th percentile of daily charge totals
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
@@ -326,11 +337,10 @@ def detect_battery_rates(path: Path) -> Tuple[float, float, float]:
     if daily_charge.empty:
         capacity_kwh = 13.0
     else:
-        # 95th percentile of daily charge, rounded to nearest 0.5 kWh
         raw = float(daily_charge.quantile(0.95))
-        capacity_kwh = round(raw * 2) / 2  # round to 0.5
+        capacity_kwh = round(raw * 2) / 2
 
-    return round(max_charge_kw, 1), round(max_discharge_kw, 1), round(capacity_kwh, 1)
+    return round(max_charge_kw, 1), round(max_discharge_kw, 1), round(capacity_kwh, 1), round(grid_export_limit_kw, 1)
 
 
 def trim_date_range(df: pd.DataFrame, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
@@ -567,6 +577,7 @@ def simulate_optimal_battery(
     battery_max_charge_kw: float = 5.0,
     battery_max_discharge_kw: float = 5.0,
     battery_efficiency: float = 0.90,
+    grid_export_limit_kw: float = 3.68,
 ):
     """Simulate optimal battery usage with corrected solar export logic.
 
@@ -606,6 +617,7 @@ def simulate_optimal_battery(
 
     slot_max_charge_kwh = battery_max_charge_kw * 0.5
     slot_max_discharge_kwh = battery_max_discharge_kw * 0.5
+    slot_max_export_kwh = grid_export_limit_kw * 0.5  # DNO grid export cap per 30-min slot
     battery_cap = scenario.battery_capacity_kwh
     min_soc = battery_cap * 0.10  # 10% reserve
 
@@ -716,9 +728,12 @@ def simulate_optimal_battery(
             # ── Discharge battery to export when export rate is high ──
             battery_to_export = 0.0
             if slot_export_rate > charge_threshold and soc > min_soc:
+                # Cap by: battery discharge rate, available SoC, and remaining grid export headroom
+                grid_export_headroom = max(slot_max_export_kwh - solar_to_export, 0.0)
                 available_discharge = min(
                     slot_max_discharge_kwh - battery_to_load,
                     soc - min_soc,
+                    grid_export_headroom,
                 )
                 available_discharge = max(available_discharge, 0.0)
                 if available_discharge > 0.01:
@@ -730,7 +745,7 @@ def simulate_optimal_battery(
 
             # Calculate costs for this slot
             total_grid_import = grid_to_load + grid_to_battery
-            total_grid_export = solar_to_export + battery_to_export
+            total_grid_export = min(solar_to_export + battery_to_export, slot_max_export_kwh)
 
             opt_import_cost_p += total_grid_import * slot_import_rate
             opt_export_revenue_p += total_grid_export * slot_export_rate
@@ -789,18 +804,22 @@ def run_analyse(args) -> int:
     charge_kw = args.battery_max_charge_kw
     discharge_kw = args.battery_max_discharge_kw
     capacity_kwh = args.battery_capacity_kwh
-    auto_detected = charge_kw is None or discharge_kw is None or capacity_kwh is None
+    grid_export_limit_kw = getattr(args, "grid_export_limit_kw", None)
+    auto_detected = charge_kw is None or discharge_kw is None or capacity_kwh is None or grid_export_limit_kw is None
     if auto_detected:
-        detected_charge, detected_discharge, detected_capacity = detect_battery_rates(power_csv)
+        detected_charge, detected_discharge, detected_capacity, detected_export_limit = detect_battery_rates(power_csv)
         if charge_kw is None:
             charge_kw = detected_charge
         if discharge_kw is None:
             discharge_kw = detected_discharge
         if capacity_kwh is None:
             capacity_kwh = detected_capacity
+        if grid_export_limit_kw is None:
+            grid_export_limit_kw = detected_export_limit
     args.battery_max_charge_kw = charge_kw
     args.battery_max_discharge_kw = discharge_kw
     args.battery_capacity_kwh = capacity_kwh
+    args.grid_export_limit_kw = grid_export_limit_kw
 
     scenario = ScenarioConfig(
         battery_capacity_kwh=args.battery_capacity_kwh,
@@ -827,6 +846,7 @@ def run_analyse(args) -> int:
     rate_note = " (auto-detected from data)" if auto_detected else ""
     print(f"  Battery: {args.battery_capacity_kwh} kWh capacity, "
           f"{args.battery_max_charge_kw}/{args.battery_max_discharge_kw} kW charge/discharge{rate_note}")
+    print(f"  Grid export limit: {args.grid_export_limit_kw} kW{rate_note}")
     print(f"  Efficiency: {args.battery_efficiency * 100:.0f}% round-trip")
     print()
 
@@ -935,6 +955,7 @@ def run_analyse(args) -> int:
             battery_max_charge_kw=args.battery_max_charge_kw,
             battery_max_discharge_kw=args.battery_max_discharge_kw,
             battery_efficiency=args.battery_efficiency,
+            grid_export_limit_kw=args.grid_export_limit_kw,
         )
         if s is not None:
             summaries.append(s)
@@ -1408,6 +1429,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum battery discharge rate in kW (default: auto-detected from data)")
     default.add_argument("--battery-efficiency", type=float, default=0.90,
         help="Battery round-trip efficiency 0-1 (default: %(default)s)")
+    default.add_argument("--grid-export-limit-kw", type=float, default=None,
+        help="Grid export limit in kW, e.g. DNO G98=3.68, G99=6.0 (default: auto-detected from data)")
     default.add_argument("--refresh-tariffs", action="store_true",
         help="Re-download tariff data even if cached")
     default.add_argument("--tariffs",
@@ -1476,6 +1499,8 @@ like buying an EV, adding a hot tub, or installing extra solar panels.""",
         help="Maximum battery discharge rate in kW (default: auto-detected from data)")
     model.add_argument("--battery-efficiency", type=float, default=0.90,
         help="Battery round-trip efficiency 0-1 (default: %(default)s)")
+    model.add_argument("--grid-export-limit-kw", type=float, default=None,
+        help="Grid export limit in kW, e.g. DNO G98=3.68, G99=6.0 (default: auto-detected from data)")
     model.add_argument("--tariffs",
         help="Comma-separated list of tariffs to simulate (default: all). "
              "Options: intelligent,agile,go,flux,cosy,flexible,tracker")
