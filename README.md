@@ -67,18 +67,21 @@ python octopus_powerwall_tariff_compare.py default --power-csv download/power.cs
 
 ### All-in-one: download + refresh tariffs + analyse
 
+If you've saved your email with `set-defaults --email`, just run `default` — it will auto-download any new Powerwall data before running the analysis.
+
 ```bash
-python octopus_powerwall_tariff_compare.py full-refresh
+python octopus_powerwall_tariff_compare.py default --refresh-tariffs
 ```
+
+`--refresh-tariffs` re-downloads the Agile/Tracker rate data even if cached.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `default` | Run full battery optimisation analysis across all tariffs |
+| `default` | Run full battery optimisation analysis across all tariffs (auto-downloads Powerwall data when `--email` is saved) |
 | `model` | Model scenarios like adding an EV or hot tub |
 | `download-data` | Download 5-minute Powerwall data from Tesla (up to 1 year) |
-| `full-refresh` | Download data + refresh tariffs + run analysis in one go |
 | `set-defaults` | Save settings (region, battery, email) so you don't retype them |
 | `list-regions` | Show supported Octopus region codes |
 | `refresh-tariffs` | Re-download Agile tariff CSVs |
@@ -121,9 +124,6 @@ python octopus_powerwall_tariff_compare.py default --power-csv power.csv \
 # Account for battery degradation
 python octopus_powerwall_tariff_compare.py default --power-csv power.csv --battery-efficiency 0.85
 
-# Disable EV charging detection
-python octopus_powerwall_tariff_compare.py default --power-csv power.csv --no-ev-exclusion
-
 # View saved defaults
 python octopus_powerwall_tariff_compare.py set-defaults --show
 
@@ -141,7 +141,7 @@ Results are written to the `output/` directory:
 
 ## Tesla Login
 
-The `download-data` and `full-refresh` commands use [TeslaPy](https://github.com/tdorssers/TeslaPy) to authenticate. On first run:
+The `download-data` command (and the auto-download triggered by `default --email`) uses [TeslaPy](https://github.com/tdorssers/TeslaPy) to authenticate. On first run:
 
 1. A URL is printed — open it in your browser
 2. Log in to your Tesla account
