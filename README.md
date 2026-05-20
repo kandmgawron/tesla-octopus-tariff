@@ -54,23 +54,23 @@ Data is saved to `download/power.csv`. Per-day files are cached in `download/pow
 ### 3. Run the analysis
 
 ```bash
-python octopus_powerwall_tariff_compare.py default
+python octopus_powerwall_tariff_compare.py
 ```
 
-This auto-downloads any new Powerwall data, then simulates optimal battery behaviour for all 7 tariffs and shows which is cheapest.
+No subcommand needed. This auto-downloads any new Powerwall data, then simulates optimal battery behaviour for all 7 tariffs and shows which is cheapest.
 
 To compare only specific tariffs:
 
 ```bash
-python octopus_powerwall_tariff_compare.py default --power-csv download/power.csv --tariffs flux,intelligent,agile
+python octopus_powerwall_tariff_compare.py --power-csv download/power.csv --tariffs flux,intelligent,agile
 ```
 
 ### All-in-one: download + refresh tariffs + analyse
 
-If you've saved your email with `set-defaults --email`, just run `default` — it will auto-download any new Powerwall data before running the analysis.
+If you've saved your email with `set-defaults --email`, the bare command auto-downloads any new Powerwall data before running the analysis.
 
 ```bash
-python octopus_powerwall_tariff_compare.py default --refresh-tariffs
+python octopus_powerwall_tariff_compare.py --refresh-tariffs
 ```
 
 `--refresh-tariffs` re-downloads the Agile/Tracker rate data even if cached.
@@ -79,7 +79,7 @@ python octopus_powerwall_tariff_compare.py default --refresh-tariffs
 
 | Command | Description |
 |---------|-------------|
-| `default` | Run full battery optimisation analysis across all tariffs (auto-downloads Powerwall data when `--email` is saved) |
+| _(none)_ / `default` | Run full battery optimisation analysis across all tariffs (auto-downloads Powerwall data when `--email` is saved) |
 | `model` | Model scenarios like adding an EV or hot tub |
 | `download-data` | Download 5-minute Powerwall data from Tesla (up to 1 year) |
 | `set-defaults` | Save settings (region, battery, email) so you don't retype them |
@@ -112,17 +112,17 @@ python octopus_powerwall_tariff_compare.py model \
 
 ```bash
 # Use a different region (C = London)
-python octopus_powerwall_tariff_compare.py default --power-csv power.csv --region-code C
+python octopus_powerwall_tariff_compare.py --power-csv power.csv --region-code C
 
 # Bigger battery (e.g. 2x Powerwall 2)
-python octopus_powerwall_tariff_compare.py default --power-csv power.csv --battery-capacity-kwh 26
+python octopus_powerwall_tariff_compare.py --power-csv power.csv --battery-capacity-kwh 26
 
 # Powerwall 3 (higher charge/discharge rate)
-python octopus_powerwall_tariff_compare.py default --power-csv power.csv \
+python octopus_powerwall_tariff_compare.py --power-csv power.csv \
     --battery-max-charge-kw 11.5 --battery-max-discharge-kw 11.5
 
 # Account for battery degradation
-python octopus_powerwall_tariff_compare.py default --power-csv power.csv --battery-efficiency 0.85
+python octopus_powerwall_tariff_compare.py --power-csv power.csv --battery-efficiency 0.85
 
 # View saved defaults
 python octopus_powerwall_tariff_compare.py set-defaults --show

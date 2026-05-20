@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -1271,11 +1272,14 @@ def build_parser() -> argparse.ArgumentParser:
   # Download a year of Powerwall data (uses saved email)
   %(prog)s download-data
 
-  # Run analysis with saved defaults
-  %(prog)s default --power-csv download/power.csv
+  # Run analysis (no subcommand needed — `default` is implied)
+  %(prog)s
+
+  # Run analysis with explicit options
+  %(prog)s --power-csv download/power.csv
 
   # Override a saved default for one run
-  %(prog)s default --power-csv power.csv --region-code C
+  %(prog)s --power-csv power.csv --region-code C
 """,
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1411,7 +1415,36 @@ like buying an EV, adding a hot tub, or installing extra solar panels.""",
     return parser
 
 
+SUBCOMMANDS = {"set-defaults", "default", "download-data", "list-regions", "refresh-tariffs", "model"}
+
+
+def _inject_default_subcommand(argv: Optional[List[str]]) -> List[str]:
+    """If no subcommand is given (or only options), prepend 'default'.
+
+    Keeps `default` as an explicit subcommand for backwards compatibility
+    but allows users to omit it: `... --power-csv foo.csv` runs the analysis.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+    else:
+        argv = list(argv)
+    # Find the first positional (non-option) argument
+    for tok in argv:
+        if not tok.startswith("-"):
+            # If it's already a known subcommand, leave argv alone.
+            # Otherwise inject 'default' at the front so argparse routes correctly.
+            if tok in SUBCOMMANDS:
+                return argv
+            break
+    # Either no positional arg, or first positional isn't a subcommand → inject 'default'.
+    # Don't inject when -h/--help is the first token (argparse should print top-level help).
+    if argv and argv[0] in ("-h", "--help"):
+        return argv
+    return ["default", *argv]
+
+
 def main(argv=None) -> int:
+    argv = _inject_default_subcommand(argv)
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -1442,8 +1475,8 @@ def main(argv=None) -> int:
             print(f"Error: {args.power_csv} not found.")
             print("Either:")
             print("  1. Save your email: set-defaults --email you@example.com")
-            print("     Then run 'default' again to auto-download from Tesla")
-            print("  2. Specify a CSV: default --power-csv /path/to/power.csv")
+            print("     Then re-run to auto-download from Tesla")
+            print("  2. Specify a CSV: --power-csv /path/to/power.csv")
             return 1
         return run_analyse(args)
     if args.command == "list-regions":
