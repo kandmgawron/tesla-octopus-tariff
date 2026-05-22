@@ -703,6 +703,8 @@ def simulate_optimal_battery(
     daily_rows = []
     total_opt_import_cost_p = 0.0
     total_opt_export_revenue_p = 0.0
+    total_import_kwh = 0.0
+    total_export_kwh = 0.0
     total_days = 0
     soc = battery_cap * 0.5  # First day starts at 50%; subsequent days carry over
     prev_day = None
@@ -858,6 +860,8 @@ def simulate_optimal_battery(
 
         total_opt_import_cost_p += opt_import_cost_p
         total_opt_export_revenue_p += opt_export_revenue_p
+        total_import_kwh += opt_grid_import_kwh
+        total_export_kwh += opt_grid_export_kwh
 
         opt_net_p = opt_import_cost_p - opt_export_revenue_p
 
@@ -891,6 +895,8 @@ def simulate_optimal_battery(
         "standing_£": round(pence_to_pounds(total_sc_p), 2),
         "total_£": round(pence_to_pounds(opt_net_total_p), 2),
         "annual_£": round(pence_to_pounds(opt_net_total_p) / max(total_days, 1) * 365, 0),
+        "import_kwh": round(total_import_kwh, 1),
+        "export_kwh": round(total_export_kwh, 1),
     }
     return summary, pd.DataFrame(daily_rows)
 
@@ -1110,6 +1116,8 @@ def run_analyse(args) -> int:
         row["import_£"] = round(row["import_£"] * scale, 0)
         row["export_£"] = round(row["export_£"] * scale, 0)
         row["standing_£"] = round(row["standing_£"] * scale, 0)
+        row["import_kwh"] = round(row["import_kwh"] * scale, 0)
+        row["export_kwh"] = round(row["export_kwh"] * scale, 0)
     print_summary_table(rows, headers=headers)
 
     best_row = rows[0]
@@ -1122,6 +1130,11 @@ def run_analyse(args) -> int:
         worst_row = rows[-1]
         spread = worst_row["annual_£"] - best_row["annual_£"]
         print(f"\n  Annual spread between best and worst: \u00a3{spread:.0f}/year")
+
+    # Show kWh details
+    print("\n  Energy flows (annualised):")
+    kwh_headers = ["tariff", "import_kwh", "export_kwh"]
+    print_summary_table(rows, headers=kwh_headers)
 
     print(f"\nOutputs written to: {out_dir}")
     return 0
