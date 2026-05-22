@@ -1027,19 +1027,24 @@ def run_analyse(args) -> int:
     summary_df = pd.DataFrame(summaries).sort_values("total_£")
     write_csv(summary_df, out_dir / "summary.csv")
 
-    # Print results
-    print("With optimal battery scheduling, your annual costs would be:")
+    # Print results — show annualised figures only (raw totals are in the CSV)
+    days = summaries[0]["days"]
+    print(f"With optimal battery scheduling (based on {days} days of data):")
     print()
-    headers = ["tariff", "import_£", "export_£", "standing_£", "total_£", "annual_£"]
+    headers = ["tariff", "import_£", "export_£", "standing_£", "annual_£"]
     rows = summary_df.to_dict(orient="records")
+    # Annualise the import/export/standing columns for display
+    for row in rows:
+        scale = 365 / max(row["days"], 1)
+        row["import_£"] = round(row["import_£"] * scale, 0)
+        row["export_£"] = round(row["export_£"] * scale, 0)
+        row["standing_£"] = round(row["standing_£"] * scale, 0)
     print_summary_table(rows, headers=headers)
 
     best_row = rows[0]
-    days = best_row["days"]
     print(f"\n{'=' * 70}")
     print(f"  BEST TARIFF: {best_row['tariff'].upper()}")
     print(f"  Estimated annual cost: \u00a3{best_row['annual_£']:.0f}/year")
-    print(f"  (Based on {days} days of data)")
     print(f"{'=' * 70}")
 
     if len(rows) > 1:
