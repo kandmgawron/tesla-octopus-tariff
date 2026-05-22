@@ -1,17 +1,18 @@
-# Octopus Powerwall Tariff Compare
+# Octopus Tariff Compare
 
-A Python CLI that downloads your Tesla Powerwall usage data and simulates optimal battery behaviour across all major Octopus Energy tariffs to find the absolute cheapest one for you.
+Find the cheapest Octopus Energy tariff for your home battery and solar setup. Works with any battery system — Tesla Powerwall, SolarEdge, GivEnergy, Solis, or any other system that can provide usage data.
 
 ## How It Works
 
-Unlike simple rate calculators, this tool runs a **full battery optimisation simulation** for each tariff. For every half-hour slot in your data, it decides the optimal action:
+This tool runs a **full battery optimisation simulation** for each tariff using your real energy data. For every half-hour slot, it decides the optimal action:
 
-- **Solar decision**: If the export rate exceeds the import rate, export ALL solar and buy from grid (net profit). Otherwise, solar serves home load first.
+- **Solar decision**: If the export rate exceeds the cost of stored energy, export all solar and serve load from battery. Otherwise, solar serves home load first.
 - **Battery charging**: Charges from grid during the cheapest import slots each day.
 - **Battery discharging**: Discharges to avoid expensive grid imports, or exports to grid when export rates are high.
-- **Efficiency losses**: Accounts for 90% round-trip battery efficiency (configurable).
-- **Physical limits**: Respects battery capacity, max charge/discharge rates, and 10% reserve floor.
-- **Realistic state**: Battery state of charge carries across days — no artificial daily reset. If the battery is depleted one evening, it stays low until the next cheap charging window.
+- **Negative rates**: When import rates go negative (Agile), maximises grid consumption.
+- **Physical limits**: Respects battery capacity, charge/discharge rates, grid export limit (DNO), and 10% reserve floor.
+- **Realistic state**: Battery state of charge carries across days. If depleted one evening, it stays low until the next cheap charging window.
+- **Auto-detection**: Battery capacity, charge/discharge rates, and grid export limit are all detected from your data automatically.
 
 ## Supported Tariffs
 
@@ -39,17 +40,35 @@ pip install -r requirements.txt
 
 ```bash
 python octopus_powerwall_tariff_compare.py set-defaults \
-  --email your-tesla-email@example.com \
   --postcode "SW1A 1AA"
 ```
 
-### 2. Run the analysis
+### 2. Get your energy data
+
+Choose one of:
+
+**Tesla Powerwall** — auto-downloads via API:
+```bash
+python octopus_powerwall_tariff_compare.py set-defaults --email your-tesla-email@example.com
+python octopus_powerwall_tariff_compare.py download-data
+```
+
+**SolarEdge** — auto-downloads via API:
+```bash
+python octopus_powerwall_tariff_compare.py set-defaults \
+  --solaredge-api-key YOUR_KEY --solaredge-site-id YOUR_ID
+python octopus_powerwall_tariff_compare.py download-solaredge
+```
+
+**Any other system** — export a CSV manually (see [Data Format](#data-format) below) and place it at `download/power.csv`.
+
+### 3. Run the analysis
 
 ```bash
 python octopus_powerwall_tariff_compare.py
 ```
 
-That's it. This auto-downloads your Powerwall data from Tesla (up to a year of history), fetches tariff rates, then simulates optimal battery behaviour for all 7 tariffs and shows which is cheapest. Per-day data is cached in `download/power/` so subsequent runs only download new days.
+That's it. The tool simulates optimal battery behaviour for all 7 tariffs and shows which is cheapest for you annually.
 
 To compare only specific tariffs:
 
@@ -57,25 +76,17 @@ To compare only specific tariffs:
 python octopus_powerwall_tariff_compare.py --tariffs flux,intelligent,agile
 ```
 
-To also refresh cached tariff rate data:
-
-```bash
-python octopus_powerwall_tariff_compare.py --refresh-tariffs
-```
-
-**`--power-csv`** — You only need this if your Powerwall data lives somewhere other than the default `download/power.csv` (e.g. you exported it manually or have multiple sites). If you've used `set-defaults --email` the tool downloads and merges data to that path automatically.
-
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| _(none)_ / `default` | Run full battery optimisation analysis across all tariffs (auto-downloads Powerwall data when `--email` is saved) |
+| _(none)_ / `default` | Run full battery optimisation analysis across all tariffs |
 | `model` | Model scenarios like adding an EV or hot tub |
-| `download-data` | Download 5-minute Powerwall data from Tesla (up to 1 year) |
-| `download-solaredge` | Download power data from SolarEdge monitoring API (up to 1 year) |
-| `set-defaults` | Save settings (region, battery, email) so you don't retype them |
+| `download-data` | Download data from Tesla (up to 1 year) |
+| `download-solaredge` | Download data from SolarEdge (up to 1 year) |
+| `set-defaults` | Save settings so you don't retype them |
 | `list-regions` | Show supported Octopus region codes |
-| `refresh-tariffs` | Re-download Agile tariff CSVs |
+| `refresh-tariffs` | Re-download Agile/Tracker rate data |
 
 ## Scenario Modelling
 
@@ -103,20 +114,20 @@ python octopus_powerwall_tariff_compare.py model \
 
 ```bash
 # Use a different region (by postcode)
-python octopus_powerwall_tariff_compare.py --power-csv power.csv --postcode "EC1A 1BB"
+python octopus_powerwall_tariff_compare.py --postcode "EC1A 1BB"
 
 # Or by region code directly
-python octopus_powerwall_tariff_compare.py --power-csv power.csv --region-code C
+python octopus_powerwall_tariff_compare.py --region-code C
 
-# Bigger battery (e.g. 2x Powerwall 2)
-python octopus_powerwall_tariff_compare.py --power-csv power.csv --battery-capacity-kwh 26
+# Override auto-detected battery specs
+python octopus_powerwall_tariff_compare.py --battery-capacity-kwh 10 \
+    --battery-max-charge-kw 3.6 --battery-max-discharge-kw 3.6
 
-# Powerwall 3 (higher charge/discharge rate)
-python octopus_powerwall_tariff_compare.py --power-csv power.csv \
-    --battery-max-charge-kw 11.5 --battery-max-discharge-kw 11.5
+# Override grid export limit (e.g. G99 approval at 6 kW)
+python octopus_powerwall_tariff_compare.py --grid-export-limit-kw 6.0
 
-# Account for battery degradation
-python octopus_powerwall_tariff_compare.py --power-csv power.csv --battery-efficiency 0.85
+# Account for battery age (reduces capacity and efficiency)
+python octopus_powerwall_tariff_compare.py --battery-age-years 5
 
 # View saved defaults
 python octopus_powerwall_tariff_compare.py set-defaults --show
@@ -129,73 +140,25 @@ python octopus_powerwall_tariff_compare.py list-regions
 
 Results are written to the `output/` directory:
 
-- `summary.csv` — All tariffs ranked by optimised net cost
+- `summary.csv` — All tariffs ranked by annual cost
 - `daily_<tariff>.csv` — Daily breakdown for each tariff
 - `model_summary.csv` — Combined scenario comparison (when using `model`)
 
-## Tesla Login
+## Data Format
 
-The `download-data` command (and the auto-download triggered by `default --email`) uses [TeslaPy](https://github.com/tdorssers/TeslaPy) to authenticate. On first run:
+The tool works with any battery system as long as you can provide a CSV with energy data at 5-minute intervals.
 
-1. A URL is printed — open it in your browser
-2. Log in to your Tesla account
-3. You'll see a "Verified Successfully" page (it will then hang — this is expected)
-4. Open your browser's Developer Tools (Cmd+Option+I on Mac)
-5. Go to the Console tab
-6. Find the message: `Failed to launch 'tesla://auth/callback?code=...'`
-7. Right-click the `tesla://auth/callback?...` URL and choose "Copy link address"
-8. Paste the full URL into the terminal
-
-Your token is cached locally so you won't need to log in again unless it expires.
-
-## SolarEdge Systems
-
-If you have a SolarEdge inverter and battery, you can download data directly from the SolarEdge monitoring API:
-
-```bash
-# One-time setup
-python octopus_powerwall_tariff_compare.py set-defaults \
-  --solaredge-api-key YOUR_API_KEY \
-  --solaredge-site-id YOUR_SITE_ID \
-  --postcode "SW1A 1AA"
-
-# Download a year of data
-python octopus_powerwall_tariff_compare.py download-solaredge
-
-# Run the analysis
-python octopus_powerwall_tariff_compare.py
-```
-
-To get your API key: log in to the [SolarEdge monitoring portal](https://monitoring.solaredge.com), go to Admin > Site Access > API Access, and generate a key. Your site ID is shown in the portal URL.
-
-Data is downloaded at 15-minute intervals and converted to the standard format automatically. Battery power is estimated from the energy balance (production + grid = consumption + export).
-
-## Using With Other Batteries
-
-This tool works with any home battery system, not just Tesla Powerwalls. You just need your usage data in the right CSV format.
-
-**Battery specs are auto-detected** from the data — capacity, max charge rate, and max discharge rate are all inferred from observed behaviour. You can override any of them manually if needed:
-
-```bash
-python octopus_powerwall_tariff_compare.py --power-csv my_data.csv \
-    --battery-capacity-kwh 10 \
-    --battery-max-charge-kw 3.6 \
-    --battery-max-discharge-kw 3.6
-```
-
-### Required CSV Format
-
-Your CSV needs 5-minute interval readings with these columns:
+### Required Columns
 
 | Column | Required | Description |
 |--------|----------|-------------|
-| `timestamp` | Yes | ISO 8601 timestamp with timezone (e.g. `2025-09-01T14:00:00+01:00`) |
+| `timestamp` | Yes | ISO 8601 with timezone (e.g. `2025-09-01T14:00:00+01:00`) |
 | `grid_power` | Yes | Grid power in watts. Positive = importing, negative = exporting |
-| `solar_power` | No | Solar generation in watts (0 if no solar) |
+| `solar_power` | No | Solar generation in watts |
 | `battery_power` | No | Battery power in watts. Negative = charging, positive = discharging |
 | `load_power` | No | Home consumption in watts |
 
-Example rows:
+### Example
 
 ```csv
 timestamp,solar_power,battery_power,grid_power,load_power
@@ -205,16 +168,35 @@ timestamp,solar_power,battery_power,grid_power,load_power
 2025-09-01T18:00:00+01:00,0.0,2000.0,-1800.0,200.0
 ```
 
-**Minimum required**: `timestamp` and `grid_power`. Without `solar_power` and `battery_power`, the tool can still run the simulation but won't auto-detect battery specs and will assume no solar generation.
+**Minimum**: `timestamp` and `grid_power`. Without `solar_power` and `battery_power`, the tool still runs but won't auto-detect battery specs and assumes no solar.
 
-**Interval**: Data should be at 5-minute intervals. The tool aggregates to 30-minute slots internally.
+**Interval**: 5-minute readings (aggregated to 30-minute slots internally). 15-minute data also works (e.g. SolarEdge).
 
 ### Getting Data From Other Systems
 
-- **GivEnergy**: Export from the GivEnergy portal or use the GivTCP API
-- **SolarEdge**: Export from the monitoring portal (may need to convert from 15-min to 5-min)
-- **Solis/Ginlong**: Export from SolisCloud
-- **Home Assistant**: Export energy sensor data with a 5-minute recording interval
-- **Enphase**: Export from the Enlighten portal
+| System | How to get data |
+|--------|----------------|
+| **Tesla Powerwall** | Built-in: `download-data` command |
+| **SolarEdge** | Built-in: `download-solaredge` command |
+| **GivEnergy** | Export from portal or use GivTCP API |
+| **Solis/Ginlong** | Export from SolisCloud |
+| **Home Assistant** | Export energy sensors at 5-min interval |
+| **Enphase** | Export from Enlighten portal |
 
-As long as you can produce a CSV with `timestamp` and `grid_power` at 5-minute intervals, the tool will work.
+## Tesla Login
+
+The `download-data` command uses [TeslaPy](https://github.com/tdorssers/TeslaPy) to authenticate. On first run:
+
+1. A URL is printed — open it in your browser
+2. Log in to your Tesla account
+3. You'll see a "Verified Successfully" page (it will then hang — this is expected)
+4. Open Developer Tools (Cmd+Option+I on Mac), go to Console tab
+5. Find `Failed to launch 'tesla://auth/callback?code=...'`
+6. Right-click the URL and choose "Copy link address"
+7. Paste into the terminal
+
+Your token is cached locally so you won't need to log in again unless it expires.
+
+## SolarEdge Setup
+
+To get your API key: log in to the [SolarEdge monitoring portal](https://monitoring.solaredge.com), go to Admin > Site Access > API Access, and generate a key. Your site ID is shown in the portal URL.
