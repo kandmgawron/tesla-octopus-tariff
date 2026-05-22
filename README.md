@@ -2,6 +2,8 @@
 
 Find the cheapest Octopus Energy tariff for your home battery and solar setup. Works with any battery system — Tesla Powerwall, SolarEdge, GivEnergy, Solis, or any other system that can provide usage data.
 
+> **Not comfortable with Python?** Use the [web app](https://github.com/kandmgawron/octopus-tariff-compare-web) instead — just upload your CSV and get results in your browser.
+
 ## How It Works
 
 This tool runs a **full battery optimisation simulation** for each tariff using your real energy data. For every half-hour slot, it decides the optimal action:
