@@ -146,6 +146,41 @@ class FlexibleTariff:
 
 
 @dataclass
+class EonNextDriveTariff:
+    """E.ON Next Drive — cheap overnight rate for EV owners."""
+    offpeak_import_p_per_kwh: float = 9.0
+    peak_import_p_per_kwh: float = 29.84
+    export_p_per_kwh: float = 4.1
+    standing_charge_p_per_day: float = 46.36
+    offpeak_start: str = "00:00"
+    offpeak_end: str = "06:00"
+
+
+@dataclass
+class BritishGasEVTariff:
+    """British Gas EV — cheap overnight rate."""
+    offpeak_import_p_per_kwh: float = 7.9
+    peak_import_p_per_kwh: float = 24.67
+    export_p_per_kwh: float = 4.1
+    standing_charge_p_per_day: float = 57.21
+    offpeak_start: str = "00:00"
+    offpeak_end: str = "05:00"
+
+
+@dataclass
+class CustomTariff:
+    """User-defined tariff from JSON file."""
+    name: str = "custom"
+    import_rates: list = None  # list of {"rate": float, "start": str, "end": str}
+    export_p_per_kwh: float = 12.0
+    standing_charge_p_per_day: float = 53.35
+
+    def __post_init__(self):
+        if self.import_rates is None:
+            self.import_rates = [{"rate": 24.50, "start": "00:00", "end": "00:00"}]
+
+
+@dataclass
 class TrackerTariff:
     """Octopus Tracker — daily variable rate tied to wholesale prices."""
     standing_charge_p_per_day: float = 53.35
@@ -461,6 +496,25 @@ def compute_tariff_rates(
 
     if tariff_name == "flexible":
         import_rates = np.full(n, tariff_config.import_p_per_kwh, dtype=float)
+        export_rates = np.full(n, default_export, dtype=float)
+        return import_rates, export_rates
+
+    if tariff_name in ("eon_next_drive", "british_gas_ev"):
+        offpeak = _minutes_in_window(minutes, tariff_config.offpeak_start, tariff_config.offpeak_end)
+        import_rates = np.where(
+            offpeak,
+            tariff_config.offpeak_import_p_per_kwh,
+            tariff_config.peak_import_p_per_kwh,
+        ).astype(float)
+        export_rates = np.full(n, default_export, dtype=float)
+        return import_rates, export_rates
+
+    if tariff_name == "custom":
+        # Custom tariff with multiple time windows
+        import_rates = np.full(n, 24.50, dtype=float)  # default fallback
+        for rate_def in tariff_config.import_rates:
+            mask = _minutes_in_window(minutes, rate_def["start"], rate_def["end"])
+            import_rates[mask] = rate_def["rate"]
         export_rates = np.full(n, default_export, dtype=float)
         return import_rates, export_rates
 
@@ -909,7 +963,7 @@ def run_analyse(args) -> int:
 
     # Determine which tariffs to simulate
     tariffs_to_run = getattr(args, "tariffs", None)
-    all_tariffs = {"intelligent", "agile", "go", "flux", "cosy", "flexible", "tracker"}
+    all_tariffs = {"intelligent", "agile", "go", "flux", "cosy", "flexible", "tracker", "eon_next_drive", "british_gas_ev"}
     if tariffs_to_run:
         selected = {t.strip().lower() for t in tariffs_to_run.split(",")}
         invalid = selected - all_tariffs
@@ -966,6 +1020,23 @@ def run_analyse(args) -> int:
             import_p_per_kwh=getattr(args, "flexible_import", 24.50),
             export_p_per_kwh=getattr(args, "flexible_export", 12.0),
             standing_charge_p_per_day=getattr(args, "flexible_standing_charge", 53.35),
+        )
+    if "eon_next_drive" in selected:
+        tariff_configs["eon_next_drive"] = EonNextDriveTariff()
+    if "british_gas_ev" in selected:
+        tariff_configs["british_gas_ev"] = BritishGasEVTariff()
+
+    # Custom tariff from JSON file
+    custom_tariff_path = getattr(args, "custom_tariff", None)
+    if custom_tariff_path:
+        import json as _json
+        with open(custom_tariff_path) as f:
+            custom_data = _json.load(f)
+        tariff_configs["custom"] = CustomTariff(
+            name=custom_data.get("name", "custom"),
+            import_rates=custom_data.get("import_rates", [{"rate": 24.50, "start": "00:00", "end": "00:00"}]),
+            export_p_per_kwh=custom_data.get("export_rate", 12.0),
+            standing_charge_p_per_day=custom_data.get("standing_charge", 53.35),
         )
 
     # Fetch variable rate data
@@ -1626,7 +1697,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Re-download tariff data even if cached")
     default.add_argument("--tariffs",
         help="Comma-separated list of tariffs to simulate (default: all). "
-             "Options: intelligent,agile,go,flux,cosy,flexible,tracker")
+             "Options: intelligent,agile,go,flux,cosy,flexible,tracker,eon_next_drive,british_gas_ev")
+    default.add_argument("--custom-tariff",
+        help="Path to a JSON file defining a custom tariff (see README for format)")
     default.set_defaults(
         extra_daily_kwh=d("extra_daily_kwh", 0.0),
         extra_start=d("extra_start", "17:00"),
